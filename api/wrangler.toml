@@ -1,0 +1,14 @@
+name = "white-nights-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# База данных D1 (бесплатно, без карты)
+[[d1_databases]]
+binding = "DB"
+database_name = "white-nights-db"
+database_id = "f000faa3-a52f-4c2d-a60b-edd5752c61e6"
+
+# Хранилище файлов Workers KV (бесплатно, без карты)
+[[kv_namespaces]]
+binding = "FILES"
+id = "ab0c32ee0dd44fb290050220865706e6"
