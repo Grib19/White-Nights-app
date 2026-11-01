@@ -22,10 +22,18 @@ const PBKDF2_ITERATIONS = 100000; // максимум, который подде
 
 const enc = new TextEncoder();
 
+// Разрешаем обращения из браузера (сайт может открываться с другого адреса).
+// Авторизация идёт через заголовок Authorization, не через cookie, поэтому так безопасно.
+const CORS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type, authorization",
+};
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: { "content-type": "application/json; charset=utf-8", ...CORS },
   });
 }
 
@@ -270,6 +278,8 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+
+    if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 
     try {
       if (method === "POST" && path === "/api/register") return await register(request, env);
