@@ -1,0 +1,18 @@
+# зависимости и сборка
+node_modules/
+dist/
+build/
+.next/
+out/
+*.log
+
+# секреты
+.env
+.env.*
+!.env.example
+
+# системные файлы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
