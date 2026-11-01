@@ -18,7 +18,7 @@
 
 ```
 docs/             описание идеи, функций, решений
-web/              сайт (Next.js), общий для всех платформ
+web/              сайт (React + Vite), общий для всех платформ
 mobile-android/   сборка Android через Capacitor
 desktop-windows/  сборка Windows через Tauri или Electron
 supabase/         миграции базы данных и настройки Supabase
