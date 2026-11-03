@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { COMMITTEE_ROLES, User, getToken, request, roleLabel, setToken } from "./api";
-import { button, card, input, page, tabs } from "./styles";
+import { button, card, colors, input, page, tabButton, tabs } from "./styles";
+import { Logo } from "./Logo";
 import { ProfilePage } from "./pages/ProfilePage";
 import { MembersPage } from "./pages/MembersPage";
 import { InfoPage } from "./pages/InfoPage";
@@ -74,12 +75,15 @@ export function App() {
 
     return (
       <main style={page}>
-        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-          <div>
-            <b>White Nights</b>
-            <div style={{ fontSize: 13, color: "#555" }}>{user.full_name} · {roleLabel(user.role)}</div>
+        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <Logo height={30} />
+            <div>
+              <b style={{ fontSize: 18 }}>СОП "Белые Ночи"</b>
+              <div style={{ fontSize: 13, color: colors.blue }}>{user.full_name} · {roleLabel(user.role)}</div>
+            </div>
           </div>
-          <button onClick={logout} style={{ padding: "6px 10px", cursor: "pointer" }}>Выйти</button>
+          <button onClick={logout} style={{ ...tabButton(false), cursor: "pointer" }}>Выйти</button>
         </header>
 
         <nav style={tabs}>
@@ -88,7 +92,7 @@ export function App() {
               key={key}
               onClick={() => setTab(key)}
               disabled={tab === key}
-              style={{ padding: "8px 12px", cursor: "pointer", fontWeight: tab === key ? 700 : 400 }}
+              style={tabButton(tab === key)}
             >
               {label}
             </button>
@@ -105,11 +109,18 @@ export function App() {
 
   return (
     <main style={page}>
-      <h1>White Nights</h1>
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <button style={button} onClick={() => setMode("login")} disabled={mode === "login"}>Вход</button>
-        <button style={button} onClick={() => setMode("register")} disabled={mode === "register"}>Регистрация</button>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, margin: "24px 0 8px" }}>
+        <Logo height={56} />
+        <div>
+          <h1 style={{ margin: 0, fontSize: 40 }}>Белые Ночи</h1>
+          <div style={{ color: colors.blue, fontSize: 16 }}>СОП "Белые Ночи" · вход в приложение</div>
+        </div>
       </div>
+      <div style={{ display: "flex", gap: 8, margin: "16px 0" }}>
+        <button style={tabButton(mode === "login")} onClick={() => setMode("login")} disabled={mode === "login"}>Вход</button>
+        <button style={tabButton(mode === "register")} onClick={() => setMode("register")} disabled={mode === "register"}>Регистрация</button>
+      </div>
+      <div style={card}>
 
       <form onSubmit={submit}>
         {mode === "register" && (
@@ -129,6 +140,7 @@ export function App() {
         </button>
       </form>
       {message && <p>{message}</p>}
+      </div>
     </main>
   );
 }
