@@ -125,7 +125,11 @@ export function SongsSection({ committee }: { committee: boolean }) {
     if (!file) return;
     setBusy(true);
     setMessage("");
-    const res = await uploadSong(file, title.trim(), author.trim());
+    // Сетевой сбой (например, сервер не ответил) не должен оставлять кнопку в состоянии «Загрузка…»
+    const res = await uploadSong(file, title.trim(), author.trim()).catch(() => ({
+      ok: false,
+      error: "Не удалось связаться с сервером. Проверьте интернет и попробуйте ещё раз.",
+    }));
     setBusy(false);
     if (res.ok) {
       setTitle("");

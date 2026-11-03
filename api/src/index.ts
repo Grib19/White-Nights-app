@@ -27,7 +27,7 @@ const enc = new TextEncoder();
 const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization",
+  "access-control-allow-headers": "content-type, authorization, x-song-title, x-song-author",
 };
 
 function json(data: unknown, status = 200): Response {
