@@ -152,17 +152,27 @@ async function currentUser(request: Request, env: Env): Promise<UserRow | null> 
 
 // ---------- обработчики ----------
 
+// Дата рождения в формате ГГГГ-ММ-ДД, не в будущем и не раньше 1900 года
+function isValidBirthDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(value + "T00:00:00Z");
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) return false;
+  return value >= "1900-01-01" && date.getTime() <= Date.now();
+}
+
 async function register(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const email = str(body.email, 254).toLowerCase();
   const password = typeof body.password === "string" ? body.password : "";
   const fullName = str(body.full_name, 200);
   const phone = str(body.phone, 30);
+  const birthDate = str(body.birth_date, 10);
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "Некорректная почта" }, 400);
   if (password.length < 8) return json({ error: "Пароль должен быть не короче 8 символов" }, 400);
   if (fullName.length < 2) return json({ error: "Укажите ФИО" }, 400);
   if (phone.length < 5) return json({ error: "Укажите номер телефона" }, 400);
+  if (!isValidBirthDate(birthDate)) return json({ error: "Укажите дату рождения" }, 400);
 
   const { hash, salt } = await hashPassword(password);
   try {
@@ -175,6 +185,14 @@ async function register(request: Request, env: Env): Promise<Response> {
   } catch {
     return json({ error: "Пользователь с такой почтой уже зарегистрирован" }, 409);
   }
+
+  // Дата рождения сразу попадает в профиль
+  await env.DB.prepare(
+    `INSERT INTO profiles (user_id, birth_date)
+     SELECT id, ? FROM users WHERE email = ?`,
+  )
+    .bind(birthDate, email)
+    .run();
 
   return json({ status: "pending", message: "Регистрация отправлена комсоставу на подтверждение" }, 201);
 }

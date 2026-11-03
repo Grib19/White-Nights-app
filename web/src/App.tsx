@@ -116,6 +116,7 @@ export function App() {
           <>
             <label>ФИО<input style={input} name="full_name" required /></label>
             <label>Телефон<input style={input} name="phone" type="tel" required /></label>
+            <label>Дата рождения<input style={input} name="birth_date" type="date" required /></label>
           </>
         )}
         <label>Почта<input style={input} name="email" type="email" required /></label>
