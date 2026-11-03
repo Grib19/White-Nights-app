@@ -223,7 +223,7 @@ function SongCard({
       </div>
       {song.author && <div style={{ color: colors.gray }}>{song.author}</div>}
       {src ? (
-        <audio controls autoPlay src={src} style={{ width: "100%", marginTop: 8 }} />
+        <AudioPlayer src={src} />
       ) : (
         <button
           onClick={play}
@@ -244,6 +244,70 @@ function SongCard({
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+// Мм:сс для времени записи
+function formatTime(sec: number): string {
+  if (!isFinite(sec) || sec < 0) return "0:00";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+// Плеер в стиле сайта: вместо стандартного серого плеера браузера
+function AudioPlayer({ src }: { src: string }) {
+  const ref = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [current, setCurrent] = useState(0);
+  const [duration, setDuration] = useState(0);
+
+  function toggle() {
+    const a = ref.current;
+    if (!a) return;
+    if (a.paused) a.play().catch(() => undefined);
+    else a.pause();
+  }
+
+  function seek(value: number) {
+    if (ref.current) ref.current.currentTime = value;
+    setCurrent(value);
+  }
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 8, background: colors.field, borderRadius: 12, padding: "10px 12px" }}>
+      <audio
+        ref={ref}
+        src={src}
+        autoPlay
+        preload="metadata"
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)}
+        onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
+        onDurationChange={(e) => setDuration(e.currentTarget.duration)}
+      />
+      <button
+        onClick={toggle}
+        aria-label={playing ? "Пауза" : "Играть"}
+        style={{ width: 44, height: 44, flexShrink: 0, borderRadius: "50%", border: "none", background: colors.yellow, color: colors.navy, fontSize: 16, fontWeight: 700, cursor: "pointer" }}
+      >
+        {playing ? "❚❚" : "▶"}
+      </button>
+      <input
+        type="range"
+        min={0}
+        max={duration || 0}
+        step={0.1}
+        value={current}
+        onChange={(e) => seek(Number(e.target.value))}
+        aria-label="Перемотка"
+        style={{ flex: 1, minWidth: 0, accentColor: colors.navy, cursor: "pointer" }}
+      />
+      <span style={{ fontSize: 14, color: colors.navy, whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
+        {formatTime(current)} / {formatTime(duration)}
+      </span>
     </div>
   );
 }
