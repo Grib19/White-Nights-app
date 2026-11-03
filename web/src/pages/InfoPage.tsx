@@ -2,6 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { User, request } from "../api";
 import { button, card, input } from "../styles";
 
+// PDF-файлы документов: лежат в web/public и скачиваются по прямой ссылке
+const DOC_FILES: Record<string, { file: string; name: string }> = {
+  "corporate-code": { file: "/korporativny-kodeks.pdf", name: "Корпоративный кодекс МООО РСО.pdf" },
+  "rules-otryad": { file: "/polozhenie-o-linejnom-otryade.pdf", name: "Положение о линейном студенческом отряде.pdf" },
+  "rules-shtab": { file: "/polozhenie-o-shtabe.pdf", name: "Положение о Штабе Молодость.pdf" },
+  symbols: { file: "/polozhenie-o-simvolike.pdf", name: "Положение о символике и атрибутике.pdf" },
+  ustav: { file: "/ustav-mooo-rso.pdf", name: "Устав МООО РСО.pdf" },
+};
+
 interface DocItem {
   slug: string;
   title: string;
@@ -69,10 +78,10 @@ export function InfoPage({ viewer }: { viewer: User }) {
         ← Назад
       </button>
       <h2>{title}</h2>
-      {slug === "corporate-code" && (
+      {DOC_FILES[slug] && (
         <a
-          href="/korporativny-kodeks.pdf"
-          download="Корпоративный кодекс МООО РСО.pdf"
+          href={DOC_FILES[slug].file}
+          download={DOC_FILES[slug].name}
           style={{ ...button, display: "inline-block", width: "auto", marginBottom: 16, textDecoration: "none", boxSizing: "border-box" }}
         >
           Скачать PDF
