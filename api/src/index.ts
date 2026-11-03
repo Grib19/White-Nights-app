@@ -271,6 +271,231 @@ async function decide(
   return json({ ok: true });
 }
 
+// ---------- профили ----------
+
+const USERNAME_RE = /^[\p{L}\p{N}_]{3,32}$/u;
+const MAX_UPLOAD = 5 * 1024 * 1024; // 5 МБ на файл
+const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf"];
+
+// Только подтверждённые участники
+async function approvedUser(request: Request, env: Env): Promise<UserRow | null> {
+  const user = await currentUser(request, env);
+  return user && user.status === "approved" ? user : null;
+}
+
+function isCommittee(user: UserRow): boolean {
+  return COMMITTEE.includes(user.role);
+}
+
+// Поля, которые участник заполняет сам и которые видят все
+const PUBLIC_FIELDS = [
+  "username",
+  "position",
+  "study_place",
+  "course",
+  "specialty",
+  "birth_date",
+  "sizes",
+  "achievements",
+  "photo_id",
+] as const;
+
+// Закрытые поля: видны только себе и комсоставу
+const PRIVATE_FIELDS = ["passport", "inn", "snils", "address", "parent_name", "parent_phone", "extra"] as const;
+
+function cleanField(value: unknown, max = 300): string {
+  return typeof value === "string" ? value.trim().slice(0, max) : "";
+}
+
+async function listProfiles(request: Request, env: Env): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+
+  const rows = await env.DB.prepare(
+    `SELECT u.id, u.full_name, u.role, p.username, p.position, p.photo_id
+       FROM users u LEFT JOIN profiles p ON p.user_id = u.id
+      WHERE u.status = 'approved'
+      ORDER BY u.full_name`,
+  ).all();
+  return json({ users: rows.results });
+}
+
+async function getProfile(request: Request, env: Env, userId: number): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+
+  const row = await env.DB.prepare(
+    `SELECT u.id, u.full_name, u.phone, u.role, u.status,
+            p.username, p.position, p.study_place, p.course, p.specialty,
+            p.birth_date, p.sizes, p.achievements, p.photo_id
+       FROM users u LEFT JOIN profiles p ON p.user_id = u.id
+      WHERE u.id = ? AND u.status = 'approved'`,
+  )
+    .bind(userId)
+    .first();
+  if (!row) return json({ error: "Участник не найден" }, 404);
+  return json({ profile: row });
+}
+
+async function getPrivateProfile(request: Request, env: Env, userId: number): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  if (viewer.id !== userId && !isCommittee(viewer)) return json({ error: "Нет доступа" }, 403);
+
+  const row = await env.DB.prepare(
+    `SELECT passport, inn, snils, address, parent_name, parent_phone, extra
+       FROM private_profiles WHERE user_id = ?`,
+  )
+    .bind(userId)
+    .first();
+  return json({ private: row ?? Object.fromEntries(PRIVATE_FIELDS.map((f) => [f, ""])) });
+}
+
+async function updateMyProfile(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+
+  const username = cleanField(body.username, 32);
+  if (username && !USERNAME_RE.test(username)) {
+    return json({ error: "Имя пользователя: от 3 до 32 букв, цифр или _" }, 400);
+  }
+  const photoId = cleanField(body.photo_id, 64);
+  if (photoId) {
+    const file = await env.FILES.getWithMetadata<{ uploadedBy: number }>(`file:${photoId}`);
+    if (!file.value || file.metadata?.uploadedBy !== user.id) {
+      return json({ error: "Фото не найдено" }, 400);
+    }
+  }
+
+  const v = Object.fromEntries(PUBLIC_FIELDS.map((f) => [f, cleanField(body[f], 300)]));
+  v.username = username || null;
+  v.photo_id = photoId || null;
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO profiles (user_id, username, position, study_place, course, specialty,
+                             birth_date, sizes, achievements, photo_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+       ON CONFLICT(user_id) DO UPDATE SET
+         username = excluded.username, position = excluded.position,
+         study_place = excluded.study_place, course = excluded.course,
+         specialty = excluded.specialty, birth_date = excluded.birth_date,
+         sizes = excluded.sizes, achievements = excluded.achievements,
+         photo_id = excluded.photo_id, updated_at = excluded.updated_at`,
+    )
+      .bind(
+        user.id,
+        v.username,
+        v.position,
+        v.study_place,
+        v.course,
+        v.specialty,
+        v.birth_date,
+        v.sizes,
+        v.achievements,
+        v.photo_id,
+      )
+      .run();
+  } catch {
+    // Почти всегда это занятое имя пользователя
+    return json({ error: "Это имя пользователя уже занято" }, 409);
+  }
+  return json({ ok: true });
+}
+
+async function updateMyPrivate(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const v = Object.fromEntries(PRIVATE_FIELDS.map((f) => [f, cleanField(body[f], 300)]));
+
+  await env.DB.prepare(
+    `INSERT INTO private_profiles (user_id, passport, inn, snils, address, parent_name, parent_phone, extra)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         passport = excluded.passport, inn = excluded.inn, snils = excluded.snils,
+         address = excluded.address, parent_name = excluded.parent_name,
+         parent_phone = excluded.parent_phone, extra = excluded.extra`,
+  )
+    .bind(user.id, v.passport, v.inn, v.snils, v.address, v.parent_name, v.parent_phone, v.extra)
+    .run();
+  return json({ ok: true });
+}
+
+// ---------- общая информация ----------
+
+async function listInfo(request: Request, env: Env): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  const rows = await env.DB.prepare("SELECT slug, title, updated_at FROM info_docs ORDER BY rowid").all();
+  return json({ docs: rows.results });
+}
+
+async function getInfo(request: Request, env: Env, slug: string): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  const row = await env.DB.prepare("SELECT slug, title, body, updated_at FROM info_docs WHERE slug = ?")
+    .bind(slug)
+    .first();
+  if (!row) return json({ error: "Раздел не найден" }, 404);
+  return json({ doc: row });
+}
+
+async function updateInfo(request: Request, env: Env, slug: string): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user || !isCommittee(user)) return json({ error: "Нет доступа" }, 403);
+  const body = await readJson(request);
+  const text = typeof body.body === "string" ? body.body.slice(0, 100000) : null;
+  if (text === null) return json({ error: "Пустой текст" }, 400);
+
+  const result = await env.DB.prepare(
+    `UPDATE info_docs SET body = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_by = ?
+      WHERE slug = ?`,
+  )
+    .bind(text, user.id, slug)
+    .run();
+  if (result.meta?.changes === 0) return json({ error: "Раздел не найден" }, 404);
+  return json({ ok: true });
+}
+
+// ---------- файлы (фото и документы) ----------
+
+async function uploadFile(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+
+  const type = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+  if (!ALLOWED_TYPES.includes(type)) return json({ error: "Можно загружать только фото и PDF" }, 400);
+
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength === 0) return json({ error: "Пустой файл" }, 400);
+  if (bytes.byteLength > MAX_UPLOAD) return json({ error: "Файл больше 5 МБ" }, 413);
+
+  const id = randomToken(16);
+  await env.FILES.put(`file:${id}`, bytes, {
+    metadata: { contentType: type, uploadedBy: user.id },
+  });
+  return json({ id, url: `/api/files/${id}` }, 201);
+}
+
+async function getFile(request: Request, env: Env, id: string): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  if (!/^[A-Za-z0-9_-]{10,64}$/.test(id)) return json({ error: "Не найдено" }, 404);
+
+  const file = await env.FILES.getWithMetadata<{ contentType: string }>(`file:${id}`, "arrayBuffer");
+  if (!file.value) return json({ error: "Не найдено" }, 404);
+  return new Response(file.value, {
+    headers: {
+      "content-type": file.metadata?.contentType ?? "application/octet-stream",
+      "cache-control": "private, max-age=3600",
+      "x-content-type-options": "nosniff",
+      ...CORS,
+    },
+  });
+}
+
 // ---------- маршрутизация ----------
 
 export default {
@@ -287,6 +512,26 @@ export default {
       if (method === "POST" && path === "/api/logout") return await logout(request, env);
       if (method === "GET" && path === "/api/me") return await me(request, env);
       if (method === "GET" && path === "/api/admin/pending") return await listPending(request, env);
+
+      if (method === "GET" && path === "/api/profiles") return await listProfiles(request, env);
+      if (method === "PUT" && path === "/api/profiles/me") return await updateMyProfile(request, env);
+      if (method === "PUT" && path === "/api/profiles/me/private") return await updateMyPrivate(request, env);
+      const profileMatch = path.match(/^\/api\/profiles\/(\d+)(\/private)?$/);
+      if (method === "GET" && profileMatch) {
+        const id = Number(profileMatch[1]);
+        return profileMatch[2]
+          ? await getPrivateProfile(request, env, id)
+          : await getProfile(request, env, id);
+      }
+
+      if (method === "GET" && path === "/api/info") return await listInfo(request, env);
+      const infoMatch = path.match(/^\/api\/info\/([a-z0-9-]{1,40})$/);
+      if (infoMatch && method === "GET") return await getInfo(request, env, infoMatch[1]);
+      if (infoMatch && method === "PUT") return await updateInfo(request, env, infoMatch[1]);
+
+      if (method === "POST" && path === "/api/files") return await uploadFile(request, env);
+      const fileMatch = path.match(/^\/api\/files\/([A-Za-z0-9_-]+)$/);
+      if (method === "GET" && fileMatch) return await getFile(request, env, fileMatch[1]);
 
       const adminMatch = path.match(/^\/api\/admin\/users\/(\d+)\/(approve|reject)$/);
       if (method === "POST" && adminMatch) {

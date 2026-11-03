@@ -1,37 +1,18 @@
 import { FormEvent, useEffect, useState } from "react";
-import { COMMITTEE_ROLES, ROLES, User, getToken, request, setToken } from "./api";
+import { COMMITTEE_ROLES, User, getToken, request, roleLabel, setToken } from "./api";
+import { button, card, input, page, tabs } from "./styles";
+import { ProfilePage } from "./pages/ProfilePage";
+import { MembersPage } from "./pages/MembersPage";
+import { InfoPage } from "./pages/InfoPage";
 
 type Mode = "login" | "register";
+type Tab = "profile" | "members" | "info" | "committee";
 
-const page: React.CSSProperties = {
-  fontFamily: "system-ui, sans-serif",
-  maxWidth: 420,
-  margin: "0 auto",
-  padding: 16,
-};
-const input: React.CSSProperties = {
-  width: "100%",
-  boxSizing: "border-box",
-  padding: 10,
-  margin: "6px 0 12px",
-  fontSize: 16,
-};
-const button: React.CSSProperties = {
-  width: "100%",
-  padding: 12,
-  fontSize: 16,
-  cursor: "pointer",
-};
-const card: React.CSSProperties = {
-  border: "1px solid #ccc",
-  borderRadius: 8,
-  padding: 12,
-  marginBottom: 12,
-};
+type Pending = User;
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [pending, setPending] = useState<User[]>([]);
+  const [tab, setTab] = useState<Tab>("profile");
   const [mode, setMode] = useState<Mode>("login");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -49,16 +30,6 @@ export function App() {
       .catch(() => setMessage("Не удалось связаться с сервером"));
   }, []);
 
-  async function loadPending() {
-    const { status, data } = await request("/api/admin/pending");
-    if (status === 200) setPending(data.users);
-    else setMessage(data.error ?? "Не удалось загрузить список");
-  }
-
-  useEffect(() => {
-    if (isCommittee) loadPending().catch(() => setMessage("Не удалось связаться с сервером"));
-  }, [isCommittee]);
-
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
@@ -71,17 +42,14 @@ export function App() {
         if (status === 201) {
           setMessage("Регистрация отправлена. Комсостав подтвердит аккаунт, после этого можно войти.");
           setMode("login");
-        } else {
-          setMessage(data.error ?? "Ошибка регистрации");
-        }
+        } else setMessage(data.error ?? "Ошибка регистрации");
       } else {
         const { status, data } = await request("/api/login", "POST", values);
         if (status === 200) {
           setToken(data.token);
           setUser(data.user);
-        } else {
-          setMessage(data.error ?? "Ошибка входа");
-        }
+          setTab("profile");
+        } else setMessage(data.error ?? "Ошибка входа");
       }
     } catch {
       setMessage("Не удалось связаться с сервером");
@@ -94,52 +62,53 @@ export function App() {
     await request("/api/logout", "POST").catch(() => undefined);
     setToken(null);
     setUser(null);
-    setPending([]);
   }
 
-  async function decide(id: number, action: "approve" | "reject", role = "candidate") {
-    const { status, data } = await request(`/api/admin/users/${id}/${action}`, "POST", { role });
-    if (status === 200) await loadPending();
-    else setMessage(data.error ?? "Не удалось выполнить действие");
-  }
-
-  // Экран после входа
   if (user) {
+    const tabList: [Tab, string][] = [
+      ["profile", "Профиль"],
+      ["members", "Участники"],
+      ["info", "Информация"],
+    ];
+    if (isCommittee) tabList.push(["committee", "Комсостав"]);
+
     return (
       <main style={page}>
-        <h1>White Nights</h1>
-        <div style={card}>
-          <div><b>{user.full_name}</b></div>
-          <div>Роль: {ROLES.find((r) => r.value === user.role)?.label ?? user.role}</div>
-          <div>Почта: {user.email}</div>
-          <button style={{ ...button, marginTop: 8 }} onClick={logout}>Выйти</button>
-        </div>
+        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div>
+            <b>White Nights</b>
+            <div style={{ fontSize: 13, color: "#555" }}>{user.full_name} · {roleLabel(user.role)}</div>
+          </div>
+          <button onClick={logout} style={{ padding: "6px 10px", cursor: "pointer" }}>Выйти</button>
+        </header>
 
-        {isCommittee && (
-          <section>
-            <h2>Ждут подтверждения ({pending.length})</h2>
-            {pending.length === 0 && <p>Новых заявок нет.</p>}
-            {pending.map((p) => (
-              <PendingCard key={p.id} user={p} onDecide={decide} />
-            ))}
-          </section>
-        )}
-        {message && <p>{message}</p>}
+        <nav style={tabs}>
+          {tabList.map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setTab(key)}
+              disabled={tab === key}
+              style={{ padding: "8px 12px", cursor: "pointer", fontWeight: tab === key ? 700 : 400 }}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+
+        {tab === "profile" && <ProfilePage user={user} />}
+        {tab === "members" && <MembersPage viewer={user} />}
+        {tab === "info" && <InfoPage viewer={user} />}
+        {tab === "committee" && isCommittee && <CommitteePage />}
       </main>
     );
   }
 
-  // Экран входа и регистрации
   return (
     <main style={page}>
       <h1>White Nights</h1>
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <button style={button} onClick={() => setMode("login")} disabled={mode === "login"}>
-          Вход
-        </button>
-        <button style={button} onClick={() => setMode("register")} disabled={mode === "register"}>
-          Регистрация
-        </button>
+        <button style={button} onClick={() => setMode("login")} disabled={mode === "login"}>Вход</button>
+        <button style={button} onClick={() => setMode("register")} disabled={mode === "register"}>Регистрация</button>
       </div>
 
       <form onSubmit={submit}>
@@ -150,7 +119,8 @@ export function App() {
           </>
         )}
         <label>Почта<input style={input} name="email" type="email" required /></label>
-        <label>Пароль (не короче 8 символов)
+        <label>
+          Пароль (не короче 8 символов)
           <input style={input} name="password" type="password" minLength={8} required />
         </label>
         <button style={button} type="submit" disabled={busy}>
@@ -159,6 +129,39 @@ export function App() {
       </form>
       {message && <p>{message}</p>}
     </main>
+  );
+}
+
+// Список заявок на подтверждение (только для комсостава)
+function CommitteePage() {
+  const [pending, setPending] = useState<Pending[]>([]);
+  const [message, setMessage] = useState("");
+
+  async function load() {
+    const { status, data } = await request("/api/admin/pending");
+    if (status === 200) setPending(data.users);
+    else setMessage(data.error ?? "Не удалось загрузить список");
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function decide(id: number, action: "approve" | "reject", role = "candidate") {
+    const { status, data } = await request(`/api/admin/users/${id}/${action}`, "POST", { role });
+    if (status === 200) await load();
+    else setMessage(data.error ?? "Не удалось выполнить действие");
+  }
+
+  return (
+    <section>
+      <h2>Ждут подтверждения ({pending.length})</h2>
+      {pending.length === 0 && <p>Новых заявок нет.</p>}
+      {pending.map((p) => (
+        <PendingCard key={p.id} user={p} onDecide={decide} />
+      ))}
+      {message && <p>{message}</p>}
+    </section>
   );
 }
 
@@ -178,8 +181,8 @@ function PendingCard({
       <label>
         Роль
         <select style={input} value={role} onChange={(e) => setRole(e.target.value)}>
-          {ROLES.map((r) => (
-            <option key={r.value} value={r.value}>{r.label}</option>
+          {["candidate", "fighter", "master", "commissar", "commander"].map((r) => (
+            <option key={r} value={r}>{roleLabel(r)}</option>
           ))}
         </select>
       </label>
