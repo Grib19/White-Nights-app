@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { User, request } from "../api";
 import { button, card, input } from "../styles";
 
@@ -15,6 +15,16 @@ export function InfoPage({ viewer }: { viewer: User }) {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [message, setMessage] = useState("");
+
+  const textRef = useRef<HTMLTextAreaElement>(null);
+
+  // Высота поля подстраивается под текст, чтобы весь документ был виден без прокрутки
+  useEffect(() => {
+    const el = textRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight + 4}px`;
+  }, [body, slug]);
 
   useEffect(() => {
     request("/api/info").then(({ data }) => setDocs(data.docs ?? []));
@@ -70,7 +80,7 @@ export function InfoPage({ viewer }: { viewer: User }) {
       )}
       {committee ? (
         <>
-          <textarea style={{ ...input, minHeight: 240 }} value={body} onChange={(e) => setBody(e.target.value)} />
+          <textarea ref={textRef} style={{ ...input, minHeight: 240, overflow: "hidden", resize: "vertical" }} value={body} onChange={(e) => setBody(e.target.value)} />
           <button style={button} onClick={save}>Сохранить</button>
         </>
       ) : (
