@@ -5,9 +5,10 @@ import { Logo } from "./Logo";
 import { ProfilePage } from "./pages/ProfilePage";
 import { MembersPage } from "./pages/MembersPage";
 import { InfoPage } from "./pages/InfoPage";
+import { MusicPage } from "./pages/MusicPage";
 
 type Mode = "login" | "register";
-type Tab = "profile" | "members" | "info" | "committee";
+type Tab = "profile" | "members" | "info" | "music" | "committee";
 
 type Pending = User;
 
@@ -67,6 +68,7 @@ export function App() {
 
   if (user) {
     const tabList: [Tab, string][] = [
+      ["music", "Музыка"],
       ["profile", "Профиль"],
       ["members", "Участники"],
       ["info", "Информация"],
@@ -102,6 +104,7 @@ export function App() {
         {tab === "profile" && <ProfilePage user={user} />}
         {tab === "members" && <MembersPage viewer={user} />}
         {tab === "info" && <InfoPage viewer={user} />}
+        {tab === "music" && <MusicPage viewer={user} />}
         {tab === "committee" && isCommittee && <CommitteePage />}
       </main>
     );

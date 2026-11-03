@@ -72,18 +72,6 @@ export function InfoPage({ viewer }: { viewer: User }) {
     );
   }
 
-  if (slug === "songs") {
-    return (
-      <section>
-        <button onClick={() => setSlug(null)} style={{ marginBottom: 12, background: "none", border: "none", color: "#94C0D9", fontSize: 16, textDecoration: "underline", cursor: "pointer" }}>
-          ← Назад
-        </button>
-        <h2>{title || "Песни"}</h2>
-        <SongsSection committee={committee} />
-      </section>
-    );
-  }
-
   return (
     <section>
       <button onClick={() => setSlug(null)} style={{ marginBottom: 12, background: "none", border: "none", color: "#94C0D9", fontSize: 16, textDecoration: "underline", cursor: "pointer" }}>
@@ -113,7 +101,7 @@ export function InfoPage({ viewer }: { viewer: User }) {
 }
 
 // Раздел «Песни»: плеер для всех участников, добавление и удаление — для комсостава
-function SongsSection({ committee }: { committee: boolean }) {
+export function SongsSection({ committee }: { committee: boolean }) {
   const [songs, setSongs] = useState<Song[]>([]);
   const [message, setMessage] = useState("");
   const [title, setTitle] = useState("");
