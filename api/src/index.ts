@@ -446,7 +446,7 @@ async function updateMyPrivate(request: Request, env: Env): Promise<Response> {
 async function listInfo(request: Request, env: Env): Promise<Response> {
   const viewer = await approvedUser(request, env);
   if (!viewer) return json({ error: "Нужен вход" }, 401);
-  const rows = await env.DB.prepare("SELECT slug, title, updated_at FROM info_docs ORDER BY rowid").all();
+  const rows = await env.DB.prepare("SELECT slug, title, updated_at FROM info_docs ORDER BY sort_order, rowid").all();
   return json({ docs: rows.results });
 }
 
