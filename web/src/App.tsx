@@ -68,8 +68,8 @@ export function App() {
 
   if (user) {
     const tabList: [Tab, string][] = [
-      ["music", "Музыка"],
       ["profile", "Профиль"],
+      ["music", "Музыка"],
       ["members", "Участники"],
       ["info", "Информация"],
     ];
