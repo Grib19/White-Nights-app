@@ -55,7 +55,7 @@ export function InfoPage({ viewer }: { viewer: User }) {
 
   return (
     <section>
-      <button onClick={() => setSlug(null)} style={{ marginBottom: 12, background: "none", border: "none", textDecoration: "underline", cursor: "pointer" }}>
+      <button onClick={() => setSlug(null)} style={{ marginBottom: 12, background: "none", border: "none", color: "#94C0D9", fontSize: 16, textDecoration: "underline", cursor: "pointer" }}>
         ← Назад
       </button>
       <h2>{title}</h2>

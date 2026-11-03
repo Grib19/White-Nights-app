@@ -95,7 +95,7 @@ function MemberCard({ id, viewer, onBack }: { id: number; viewer: User; onBack: 
 
   return (
     <section>
-      <button onClick={onBack} style={{ marginBottom: 12, background: "none", border: "none", textDecoration: "underline", cursor: "pointer" }}>
+      <button onClick={onBack} style={{ marginBottom: 12, background: "none", border: "none", color: "#94C0D9", fontSize: 16, textDecoration: "underline", cursor: "pointer" }}>
         ← Назад к списку
       </button>
       {error && <p>{error}</p>}
