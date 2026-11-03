@@ -80,6 +80,38 @@ export async function uploadFile(file: File): Promise<{ ok: boolean; id?: string
   return { ok: false, error: data.error ?? "Не удалось загрузить файл" };
 }
 
+export interface Song {
+  id: string;
+  title: string;
+  author: string;
+  created_at: string;
+}
+
+// Загрузка песни (только комсостав). Название и автор уходят в заголовках, закодированными в URL.
+export async function uploadSong(file: File, title: string, author: string): Promise<{ ok: boolean; error?: string }> {
+  const type = file.type || (file.name.toLowerCase().endsWith(".m4a") ? "audio/mp4" : "audio/mpeg");
+  const res = await fetch(baseUrl() + "/api/songs", {
+    method: "POST",
+    headers: {
+      ...authHeaders(),
+      "content-type": type,
+      "x-song-title": encodeURIComponent(title),
+      "x-song-author": encodeURIComponent(author),
+    },
+    body: file,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 201) return { ok: true };
+  return { ok: false, error: data.error ?? "Не удалось загрузить песню" };
+}
+
+// Аудио песни с защищённого адреса: плееру нельзя передать заголовок входа, поэтому грузим через fetch
+export async function loadAudio(id: string): Promise<string | null> {
+  const res = await fetch(baseUrl() + `/api/songs/${id}/audio`, { headers: authHeaders() });
+  if (!res.ok) return null;
+  return URL.createObjectURL(await res.blob());
+}
+
 // Картинка с защищённого адреса: браузер сам не передаёт заголовок входа, поэтому грузим через fetch
 export async function loadImage(id: string): Promise<string | null> {
   const res = await fetch(baseUrl() + `/api/files/${id}`, { headers: authHeaders() });

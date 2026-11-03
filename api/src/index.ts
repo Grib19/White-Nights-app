@@ -26,7 +26,7 @@ const enc = new TextEncoder();
 // Авторизация идёт через заголовок Authorization, не через cookie, поэтому так безопасно.
 const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
   "access-control-allow-headers": "content-type, authorization",
 };
 
@@ -514,6 +514,84 @@ async function getFile(request: Request, env: Env, id: string): Promise<Response
   });
 }
 
+// ---------- песни ----------
+// Аудио хранится в KV (ключ song:<id>), список и порядок — в таблице songs.
+// Загружать может только комсостав.
+
+const ALLOWED_AUDIO = ["audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/wav", "audio/ogg"];
+const MAX_AUDIO = 20 * 1024 * 1024;
+
+// Заголовки HTTP передаются только латиницей, поэтому название и автор приходят в URL-кодировке
+function decodeHeader(value: string | null, max: number): string {
+  if (!value) return "";
+  try {
+    return decodeURIComponent(value).trim().slice(0, max);
+  } catch {
+    return "";
+  }
+}
+
+async function listSongs(request: Request, env: Env): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  const rows = await env.DB.prepare(
+    "SELECT id, title, author, created_at FROM songs ORDER BY position, created_at",
+  ).all();
+  return json({ songs: rows.results });
+}
+
+async function addSong(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user || !isCommittee(user)) return json({ error: "Нет доступа" }, 403);
+
+  const type = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+  if (!ALLOWED_AUDIO.includes(type)) return json({ error: "Можно загружать только аудио: mp3, m4a, wav, ogg" }, 400);
+
+  const title = decodeHeader(request.headers.get("x-song-title"), 200);
+  const author = decodeHeader(request.headers.get("x-song-author"), 200);
+  if (!title) return json({ error: "Укажите название песни" }, 400);
+
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength === 0) return json({ error: "Пустой файл" }, 400);
+  if (bytes.byteLength > MAX_AUDIO) return json({ error: "Файл больше 20 МБ" }, 413);
+
+  const id = randomToken(16);
+  await env.FILES.put(`song:${id}`, bytes, { metadata: { contentType: type } });
+  await env.DB.prepare(
+    `INSERT INTO songs (id, title, author, content_type, position, uploaded_by)
+     VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM songs), ?)`,
+  )
+    .bind(id, title, author, type, user.id)
+    .run();
+  return json({ ok: true, id }, 201);
+}
+
+async function getSongAudio(request: Request, env: Env, id: string): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  if (!/^[A-Za-z0-9_-]{10,64}$/.test(id)) return json({ error: "Не найдено" }, 404);
+
+  const file = await env.FILES.getWithMetadata<{ contentType: string }>(`song:${id}`, "arrayBuffer");
+  if (!file.value) return json({ error: "Не найдено" }, 404);
+  return new Response(file.value, {
+    headers: {
+      "content-type": file.metadata?.contentType ?? "audio/mpeg",
+      "cache-control": "private, max-age=3600",
+      "x-content-type-options": "nosniff",
+      ...CORS,
+    },
+  });
+}
+
+async function deleteSong(request: Request, env: Env, id: string): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user || !isCommittee(user)) return json({ error: "Нет доступа" }, 403);
+  const result = await env.DB.prepare("DELETE FROM songs WHERE id = ?").bind(id).run();
+  if (result.meta?.changes === 0) return json({ error: "Песня не найдена" }, 404);
+  await env.FILES.delete(`song:${id}`);
+  return json({ ok: true });
+}
+
 // ---------- маршрутизация ----------
 
 export default {
@@ -550,6 +628,13 @@ export default {
       if (method === "POST" && path === "/api/files") return await uploadFile(request, env);
       const fileMatch = path.match(/^\/api\/files\/([A-Za-z0-9_-]+)$/);
       if (method === "GET" && fileMatch) return await getFile(request, env, fileMatch[1]);
+
+      if (method === "GET" && path === "/api/songs") return await listSongs(request, env);
+      if (method === "POST" && path === "/api/songs") return await addSong(request, env);
+      const songAudioMatch = path.match(/^\/api\/songs\/([A-Za-z0-9_-]+)\/audio$/);
+      if (method === "GET" && songAudioMatch) return await getSongAudio(request, env, songAudioMatch[1]);
+      const songMatch = path.match(/^\/api\/songs\/([A-Za-z0-9_-]+)$/);
+      if (method === "DELETE" && songMatch) return await deleteSong(request, env, songMatch[1]);
 
       const adminMatch = path.match(/^\/api\/admin\/users\/(\d+)\/(approve|reject)$/);
       if (method === "POST" && adminMatch) {
