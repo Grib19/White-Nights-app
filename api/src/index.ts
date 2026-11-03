@@ -30,10 +30,10 @@ const CORS: Record<string, string> = {
   "access-control-allow-headers": "content-type, authorization",
 };
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", ...CORS },
+    headers: { "content-type": "application/json; charset=utf-8", ...CORS, ...extra },
   });
 }
 
@@ -150,6 +150,96 @@ async function currentUser(request: Request, env: Env): Promise<UserRow | null> 
   return row;
 }
 
+// ---------- защита от перебора ----------
+
+interface Limit {
+  max: number; // сколько попыток разрешено
+  windowMs: number; // за какое время они считаются
+  blockMs: number; // на сколько блокируем, когда попыток слишком много
+}
+
+const LIMITS: Record<string, Limit> = {
+  // По одной почте: пять неудач за 15 минут — блокировка на 15 минут.
+  loginEmail: { max: 5, windowMs: 15 * 60 * 1000, blockMs: 15 * 60 * 1000 },
+  // По одному адресу в сети: двадцать неудач за 15 минут — блокировка на 30 минут.
+  // Так не подберут пароль, перебирая разные почты с одного компьютера.
+  loginIp: { max: 20, windowMs: 15 * 60 * 1000, blockMs: 30 * 60 * 1000 },
+  // Регистрации с одного адреса: пять за час, иначе список заявок завалят мусором.
+  register: { max: 5, windowMs: 60 * 60 * 1000, blockMs: 60 * 60 * 1000 },
+};
+
+function clientIp(request: Request): string {
+  return request.headers.get("cf-connecting-ip") ?? "unknown";
+}
+
+// Сколько секунд осталось до разблокировки. Ноль — значит не заблокировано.
+async function blockedFor(env: Env, key: string): Promise<number> {
+  const row = await env.DB.prepare("SELECT blocked_until FROM rate_limits WHERE limit_key = ?")
+    .bind(key)
+    .first<{ blocked_until: string | null }>();
+  if (!row?.blocked_until) return 0;
+  const left = Date.parse(row.blocked_until) - Date.now();
+  return left > 0 ? Math.ceil(left / 1000) : 0;
+}
+
+// Засчитывает попытку. Когда их становится больше разрешённого, выставляет блокировку.
+async function recordAttempt(env: Env, key: string, limit: Limit): Promise<void> {
+  const now = Date.now();
+  const row = await env.DB.prepare(
+    "SELECT count, window_start FROM rate_limits WHERE limit_key = ?",
+  )
+    .bind(key)
+    .first<{ count: number; window_start: string }>();
+
+  // Если прошлое окно уже истекло, счёт начинается заново
+  const inWindow = !!row && now - Date.parse(row.window_start) < limit.windowMs;
+  const count = (inWindow ? row!.count : 0) + 1;
+  const windowStart = inWindow ? row!.window_start : new Date(now).toISOString();
+  const blockedUntil = count >= limit.max ? new Date(now + limit.blockMs).toISOString() : null;
+
+  await env.DB.prepare(
+    `INSERT INTO rate_limits (limit_key, count, window_start, blocked_until) VALUES (?, ?, ?, ?)
+       ON CONFLICT(limit_key) DO UPDATE SET count = ?, window_start = ?, blocked_until = ?`,
+  )
+    .bind(key, count, windowStart, blockedUntil, count, windowStart, blockedUntil)
+    .run();
+}
+
+async function clearLimit(env: Env, key: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM rate_limits WHERE limit_key = ?").bind(key).run();
+}
+
+// Изредка убираем старые записи, чтобы таблицы не росли без конца.
+async function cleanupSometimes(env: Env): Promise<void> {
+  if (Math.random() > 0.02) return;
+  const now = new Date().toISOString();
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  await env.DB.prepare(
+    `DELETE FROM rate_limits
+      WHERE (blocked_until IS NULL OR blocked_until < ?) AND window_start < ?`,
+  )
+    .bind(now, dayAgo)
+    .run();
+  await env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(now).run();
+}
+
+function tooMany(seconds: number): Response {
+  const minutes = Math.max(1, Math.ceil(seconds / 60));
+  return json(
+    { error: `Слишком много попыток. Попробуйте через ${minutes} мин.` },
+    429,
+    { "retry-after": String(seconds) },
+  );
+}
+
+// Проверка пароля для несуществующей почты: считаем столько же, сколько для настоящей,
+// чтобы по времени ответа нельзя было узнать, зарегистрирован ли такой адрес.
+const DUMMY_SALT = new Uint8Array(16);
+async function fakeVerify(password: string): Promise<boolean> {
+  await derivePassword(password, DUMMY_SALT);
+  return false;
+}
+
 // ---------- обработчики ----------
 
 async function register(request: Request, env: Env): Promise<Response> {
@@ -158,6 +248,11 @@ async function register(request: Request, env: Env): Promise<Response> {
   const password = typeof body.password === "string" ? body.password : "";
   const fullName = str(body.full_name, 200);
   const phone = str(body.phone, 30);
+
+  // Не даём забрасывать заявками с одного адреса
+  const ipKey = `register:ip:${clientIp(request)}`;
+  const blocked = await blockedFor(env, ipKey);
+  if (blocked > 0) return tooMany(blocked);
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "Некорректная почта" }, 400);
   if (password.length < 8) return json({ error: "Пароль должен быть не короче 8 символов" }, 400);
@@ -173,9 +268,11 @@ async function register(request: Request, env: Env): Promise<Response> {
       .bind(email, phone, fullName, hash, salt)
       .run();
   } catch {
+    await recordAttempt(env, ipKey, LIMITS.register);
     return json({ error: "Пользователь с такой почтой уже зарегистрирован" }, 409);
   }
 
+  await recordAttempt(env, ipKey, LIMITS.register);
   return json({ status: "pending", message: "Регистрация отправлена комсоставу на подтверждение" }, 201);
 }
 
@@ -184,6 +281,16 @@ async function login(request: Request, env: Env): Promise<Response> {
   const email = str(body.email, 254).toLowerCase();
   const password = typeof body.password === "string" ? body.password : "";
 
+  // Две защиты сразу: по почте (подбор пароля к одному аккаунту)
+  // и по адресу в сети (перебор разных почт с одного компьютера)
+  const ipKey = `login:ip:${clientIp(request)}`;
+  const emailKey = `login:email:${email}`;
+  const blocked = Math.max(
+    await blockedFor(env, ipKey),
+    email ? await blockedFor(env, emailKey) : 0,
+  );
+  if (blocked > 0) return tooMany(blocked);
+
   const row = await env.DB.prepare(
     `SELECT id, email, phone, full_name, role, status, created_at, password_hash, password_salt
        FROM users WHERE email = ?`,
@@ -191,9 +298,20 @@ async function login(request: Request, env: Env): Promise<Response> {
     .bind(email)
     .first<UserRow & { password_hash: string; password_salt: string }>();
 
-  // Одинаковый ответ для неверной почты и неверного пароля
-  const ok = row ? await verifyPassword(password, row.password_hash, row.password_salt) : false;
-  if (!row || !ok) return json({ error: "Неверная почта или пароль" }, 401);
+  // Одинаковый ответ и одинаковое время для неверной почты и неверного пароля
+  const ok = row
+    ? await verifyPassword(password, row.password_hash, row.password_salt)
+    : await fakeVerify(password);
+  if (!row || !ok) {
+    await recordAttempt(env, ipKey, LIMITS.loginIp);
+    if (email) await recordAttempt(env, emailKey, LIMITS.loginEmail);
+    return json({ error: "Неверная почта или пароль" }, 401);
+  }
+
+  // Пароль верный: снимаем счётчик по этой почте.
+  // Счётчик по адресу в сети не трогаем, иначе его можно было бы сбрасывать
+  // входом в один известный аккаунт и продолжать перебор остальных.
+  await clearLimit(env, emailKey);
 
   if (row.status !== "approved") {
     return json(
@@ -274,12 +392,15 @@ async function decide(
 // ---------- маршрутизация ----------
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
 
     if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+
+    // Уборка идёт в фоне и не задерживает ответ
+    ctx.waitUntil(cleanupSometimes(env).catch(() => undefined));
 
     try {
       if (method === "POST" && path === "/api/register") return await register(request, env);
