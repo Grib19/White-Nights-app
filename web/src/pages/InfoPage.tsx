@@ -40,13 +40,6 @@ export function InfoPage({ viewer }: { viewer: User }) {
   if (!slug) {
     return (
       <section>
-        <a
-          href="/korporativny-kodeks.pdf"
-          download="Корпоративный кодекс МООО РСО.pdf"
-          style={{ ...button, display: "block", textAlign: "center", textDecoration: "none", boxSizing: "border-box", marginBottom: 16 }}
-        >
-          Скачать Корпоративный кодекс (PDF)
-        </a>
         {docs.map((d) => (
           <button
             key={d.slug}
@@ -66,6 +59,15 @@ export function InfoPage({ viewer }: { viewer: User }) {
         ← Назад
       </button>
       <h2>{title}</h2>
+      {slug === "corporate-code" && (
+        <a
+          href="/korporativny-kodeks.pdf"
+          download="Корпоративный кодекс МООО РСО.pdf"
+          style={{ ...button, display: "inline-block", width: "auto", marginBottom: 16, textDecoration: "none", boxSizing: "border-box" }}
+        >
+          Скачать PDF
+        </a>
+      )}
       {committee ? (
         <>
           <textarea style={{ ...input, minHeight: 240 }} value={body} onChange={(e) => setBody(e.target.value)} />
