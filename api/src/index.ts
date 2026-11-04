@@ -514,6 +514,37 @@ async function getFile(request: Request, env: Env, id: string): Promise<Response
   });
 }
 
+// Писать в «Важное» могут комсостав и участники, которым комсостав разрешил
+async function canPostImportant(env: Env, user: UserRow): Promise<boolean> {
+  if (isCommittee(user)) return true;
+  const row = await env.DB.prepare("SELECT can_post_important FROM users WHERE id = ?")
+    .bind(user.id)
+    .first<{ can_post_important: number }>();
+  return !!row?.can_post_important;
+}
+
+// Список подтверждённых участников с правом писать в «Важное» (только комсостав)
+async function listMembersAccess(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user || !isCommittee(user)) return json({ error: "Нет доступа" }, 403);
+  const rows = await env.DB.prepare(
+    "SELECT id, full_name, role, can_post_important FROM users WHERE status = 'approved' ORDER BY full_name",
+  ).all();
+  return json({ members: rows.results });
+}
+
+async function setImportantAccess(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user || !isCommittee(user)) return json({ error: "Нет доступа" }, 403);
+  const body = await readJson(request);
+  const allow = body.allow === true ? 1 : 0;
+  const result = await env.DB.prepare("UPDATE users SET can_post_important = ? WHERE id = ? AND status = 'approved'")
+    .bind(allow, id)
+    .run();
+  if (result.meta?.changes === 0) return json({ error: "Участник не найден" }, 404);
+  return json({ ok: true });
+}
+
 // ---------- лента новостей ----------
 // Любой подтверждённый участник пишет пост: текст, фото, любой файл и/или опрос.
 // Удалить может автор или комсостав.
@@ -603,13 +634,17 @@ async function loadPolls(env: Env, postIds: number[], userId: number): Promise<M
 async function listPosts(request: Request, env: Env): Promise<Response> {
   const viewer = await approvedUser(request, env);
   if (!viewer) return json({ error: "Нужен вход" }, 401);
+  const section = new URL(request.url).searchParams.get("section") === "important" ? "important" : "posts";
   const rows = (
     await env.DB.prepare(
       `SELECT p.id, p.body, p.photo_id, p.text_position, p.attachment_id, p.attachment_name,
               p.created_at, p.author_id, u.full_name AS author_name
          FROM posts p JOIN users u ON u.id = p.author_id
+        WHERE p.section = ?
         ORDER BY p.created_at DESC, p.id DESC LIMIT 100`,
-    ).all()
+    )
+      .bind(section)
+      .all()
   ).results as Array<{ id: number }>;
   const polls = await loadPolls(
     env,
@@ -620,6 +655,7 @@ async function listPosts(request: Request, env: Env): Promise<Response> {
     posts: rows.map((r) => ({ ...r, poll: polls.get(r.id) ?? null })),
     viewer_id: viewer.id,
     viewer_committee: isCommittee(viewer),
+    can_post_important: await canPostImportant(env, viewer),
   });
 }
 
@@ -631,6 +667,10 @@ async function addPost(request: Request, env: Env): Promise<Response> {
   const photoId = str(body.photo_id, 64);
   const attachmentId = str(body.attachment_id, 64);
   const textPosition = body.text_position === "bottom" ? "bottom" : "top";
+  const section = body.section === "important" ? "important" : "posts";
+  if (section === "important" && !(await canPostImportant(env, user))) {
+    return json({ error: "В «Важное» может писать только комсостав и отмеченные им участники" }, 403);
+  }
 
   let poll: {
     question: string;
@@ -682,10 +722,10 @@ async function addPost(request: Request, env: Env): Promise<Response> {
   }
 
   const result = await env.DB.prepare(
-    `INSERT INTO posts (author_id, body, photo_id, text_position, attachment_id, attachment_name)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO posts (author_id, body, photo_id, text_position, attachment_id, attachment_name, section)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(user.id, text, photoId || null, textPosition, attachmentId || null, attachmentName)
+    .bind(user.id, text, photoId || null, textPosition, attachmentId || null, attachmentName, section)
     .run();
   const postId = result.meta?.last_row_id;
 
@@ -936,6 +976,10 @@ export default {
       if (method === "GET" && songAudioMatch) return await getSongAudio(request, env, songAudioMatch[1]);
       const songMatch = path.match(/^\/api\/songs\/([A-Za-z0-9_-]+)$/);
       if (method === "DELETE" && songMatch) return await deleteSong(request, env, songMatch[1]);
+
+      if (method === "GET" && path === "/api/admin/members") return await listMembersAccess(request, env);
+      const importantMatch = path.match(/^\/api\/admin\/users\/(\d+)\/important$/);
+      if (method === "POST" && importantMatch) return await setImportantAccess(request, env, Number(importantMatch[1]));
 
       const adminMatch = path.match(/^\/api\/admin\/users\/(\d+)\/(approve|reject)$/);
       if (method === "POST" && adminMatch) {

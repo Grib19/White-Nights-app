@@ -1,6 +1,6 @@
 import { CSSProperties, FormEvent, useEffect, useState } from "react";
 import { User, downloadAttachment, loadImage, request, uploadAttachment, uploadFile } from "../api";
-import { button, card, colors, input } from "../styles";
+import { button, card, colors, input, tabButton } from "../styles";
 
 interface PollOption {
   id: number;
@@ -41,6 +41,9 @@ export function FeedPage({ viewer }: { viewer: User }) {
   const [posts, setPosts] = useState<Post[]>([]);
   const [committee, setCommittee] = useState(false);
   const [message, setMessage] = useState("");
+  // Раздел ленты: «Важное» (пишут комсостав и отмеченные им) или «Посты» (пишет кто угодно)
+  const [section, setSection] = useState<"important" | "posts">("important");
+  const [canImportant, setCanImportant] = useState(false);
 
   // Новый пост
   const [body, setBody] = useState("");
@@ -63,16 +66,18 @@ export function FeedPage({ viewer }: { viewer: User }) {
   const canPublish = !!body.trim() || !!attached || (pollOn && !!question.trim());
 
   async function load() {
-    const { status, data } = await request("/api/posts");
+    const { status, data } = await request(`/api/posts?section=${section}`);
     if (status === 200) {
       setPosts(data.posts ?? []);
       setCommittee(!!data.viewer_committee);
+      setCanImportant(!!data.can_post_important);
     } else setMessage(data.error ?? "Не удалось загрузить ленту");
   }
 
   useEffect(() => {
+    setMessage("");
     load();
-  }, []);
+  }, [section]);
 
   function resetComposer() {
     setBody("");
@@ -115,6 +120,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
           }
         : undefined;
       const { status, data } = await request("/api/posts", "POST", {
+        section,
         body: body.trim(),
         text_position: textTop ? "top" : "bottom",
         photo_id: photoId,
@@ -143,10 +149,24 @@ export function FeedPage({ viewer }: { viewer: User }) {
     setOptions((list) => list.map((o, j) => (j === i ? value : o)));
   }
 
+  const canWrite = section === "posts" || canImportant;
+
   return (
     <section>
       <h2>Лента</h2>
-      <form onSubmit={publish} style={card}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <button className="nav-tab" onClick={() => setSection("important")} disabled={section === "important"} style={tabButton(section === "important")}>
+          Важное
+        </button>
+        <button className="nav-tab" onClick={() => setSection("posts")} disabled={section === "posts"} style={tabButton(section === "posts")}>
+          Посты
+        </button>
+      </div>
+
+      {!canWrite && (
+        <div style={card}>В «Важное» пишет комсостав и участники, которым комсостав разрешил.</div>
+      )}
+      {canWrite && <form onSubmit={publish} style={card}>
         <textarea
           style={{ ...input, minHeight: 90 }}
           placeholder="Что нового в отряде?"
@@ -226,7 +246,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
         <button style={button} type="submit" disabled={busy || !canPublish}>
           {busy ? "Публикация…" : "Опубликовать"}
         </button>
-      </form>
+      </form>}
 
       {posts.length === 0 && <div style={card}>Постов пока нет.</div>}
       {posts.map((post) => (

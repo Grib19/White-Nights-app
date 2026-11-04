@@ -207,6 +207,7 @@ function CommitteePage() {
         <PendingCard key={p.id} user={p} onDecide={decide} />
       ))}
       {message && <p>{message}</p>}
+      <ImportantAccess />
     </section>
   );
 }
@@ -236,6 +237,45 @@ function PendingCard({
         <button style={button} onClick={() => onDecide(user.id, "approve", role)}>Подтвердить</button>
         <button style={button} onClick={() => onDecide(user.id, "reject")}>Отклонить</button>
       </div>
+    </div>
+  );
+}
+
+// Право писать в «Важное»: выдаёт комсостав. Комсостав пишет туда всегда.
+function ImportantAccess() {
+  const [members, setMembers] = useState<{ id: number; full_name: string; role: string; can_post_important: number }[]>([]);
+  const [message, setMessage] = useState("");
+
+  async function load() {
+    const { status, data } = await request("/api/admin/members");
+    if (status === 200) setMembers(data.members ?? []);
+    else setMessage(data.error ?? "Не удалось загрузить список");
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function toggle(id: number, allow: boolean) {
+    const { status, data } = await request(`/api/admin/users/${id}/important`, "POST", { allow });
+    if (status === 200) await load();
+    else setMessage(data.error ?? "Не удалось сохранить");
+  }
+
+  return (
+    <div style={card}>
+      <h3 style={{ marginTop: 0 }}>Право писать в «Важное»</h3>
+      <p style={{ color: colors.gray, fontSize: 14, marginTop: 0 }}>
+        Комсостав пишет в «Важное» всегда. Отметьте участников, которым тоже можно писать.
+      </p>
+      {members.map((m) => (
+        <label key={m.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0" }}>
+          <input type="checkbox" checked={!!m.can_post_important} onChange={(e) => toggle(m.id, e.target.checked)} />
+          <span>{m.full_name}</span>
+          <span style={{ color: colors.gray, fontSize: 13 }}>{roleLabel(m.role)}</span>
+        </label>
+      ))}
+      {message && <p>{message}</p>}
     </div>
   );
 }
