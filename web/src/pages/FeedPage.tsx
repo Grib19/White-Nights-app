@@ -6,6 +6,7 @@ interface PollOption {
   id: number;
   text: string;
   votes: number;
+  voters?: string[]; // только в неанонимных опросах
 }
 
 interface Poll {
@@ -13,6 +14,7 @@ interface Poll {
   question: string;
   multiple: boolean;
   lock_vote: boolean;
+  anonymous: boolean;
   ends_at: string | null;
   ended: boolean;
   options: PollOption[];
@@ -51,6 +53,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
   const [options, setOptions] = useState<string[]>(["", ""]);
   const [multiple, setMultiple] = useState(false);
   const [lock, setLock] = useState(false);
+  const [anonymous, setAnonymous] = useState(false);
   const [timed, setTimed] = useState(false);
   const [endsAt, setEndsAt] = useState("");
   const [busy, setBusy] = useState(false);
@@ -80,6 +83,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
     setOptions(["", ""]);
     setMultiple(false);
     setLock(false);
+    setAnonymous(false);
     setTimed(false);
     setEndsAt("");
   }
@@ -106,6 +110,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
             options: options.map((o) => o.trim()).filter(Boolean),
             multiple,
             lock,
+            anonymous,
             ends_at: timed && endsAt ? new Date(endsAt).toISOString() : null,
           }
         : undefined;
@@ -202,6 +207,9 @@ export function FeedPage({ viewer }: { viewer: User }) {
             </label>
             <label style={checkRow}>
               <input type="checkbox" checked={lock} onChange={(e) => setLock(e.target.checked)} /> Запретить отмену голоса
+            </label>
+            <label style={checkRow}>
+              <input type="checkbox" checked={anonymous} onChange={(e) => setAnonymous(e.target.checked)} /> Анонимно
             </label>
             <label style={checkRow}>
               <input type="checkbox" checked={timed} onChange={(e) => setTimed(e.target.checked)} /> Ограниченное время голосования
@@ -320,8 +328,11 @@ function PollView({ poll, onVoted }: { poll: Poll; onVoted: () => void }) {
     else setError(data.error ?? "Не удалось проголосовать");
   }
 
+  const [showVoters, setShowVoters] = useState(false);
+
   const status = [
     poll.multiple ? "Можно выбрать несколько вариантов" : "Один вариант",
+    poll.anonymous ? "анонимно" : null,
     poll.lock_vote ? "отмена голоса запрещена" : null,
     poll.ended ? "голосование завершено" : poll.ends_at ? `до ${new Date(poll.ends_at).toLocaleString("ru-RU")}` : null,
   ]
@@ -362,6 +373,25 @@ function PollView({ poll, onVoted }: { poll: Poll; onVoted: () => void }) {
         );
       })}
       <div style={{ fontSize: 13, color: colors.gray }}>Проголосовало: {total}</div>
+      {poll.anonymous ? (
+        <div style={{ fontSize: 13, color: colors.gray, marginTop: 4 }}>Опрос анонимный, имена не показываются.</div>
+      ) : (
+        total > 0 && (
+          <div style={{ marginTop: 4 }}>
+            <button type="button" onClick={() => setShowVoters((v) => !v)} style={linkButton}>
+              {showVoters ? "Скрыть, кто проголосовал" : "Кто проголосовал"}
+            </button>
+            {showVoters &&
+              poll.options
+                .filter((o) => (o.voters ?? []).length > 0)
+                .map((o) => (
+                  <div key={o.id} style={{ fontSize: 14, marginTop: 6 }}>
+                    <b>{o.text}:</b> {(o.voters ?? []).join(", ")}
+                  </div>
+                ))}
+          </div>
+        )
+      )}
       {error && <div style={{ color: "#b00020", fontSize: 14 }}>{error}</div>}
     </div>
   );

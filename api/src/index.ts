@@ -527,6 +527,7 @@ interface PollRow {
   question: string;
   multiple: number;
   lock_vote: number;
+  anonymous: number;
   ends_at: string | null;
 }
 
@@ -537,7 +538,7 @@ async function loadPolls(env: Env, postIds: number[], userId: number): Promise<M
   const marks = postIds.map(() => "?").join(",");
   const pollRows = (
     await env.DB.prepare(
-      `SELECT id, post_id, question, multiple, lock_vote, ends_at FROM polls WHERE post_id IN (${marks})`,
+      `SELECT id, post_id, question, multiple, lock_vote, anonymous, ends_at FROM polls WHERE post_id IN (${marks})`,
     )
       .bind(...postIds)
       .all<PollRow>()
@@ -560,17 +561,39 @@ async function loadPolls(env: Env, postIds: number[], userId: number): Promise<M
       .bind(userId, ...pollIds)
       .all<{ poll_id: number; option_id: number }>()
   ).results;
+  // Кто проголосовал — только в неанонимных опросах
+  const voterRows = (
+    await env.DB.prepare(
+      `SELECT v.poll_id, v.option_id, u.full_name
+         FROM poll_votes v JOIN users u ON u.id = v.user_id
+        WHERE v.poll_id IN (${pMarks})
+        ORDER BY u.full_name`,
+    )
+      .bind(...pollIds)
+      .all<{ poll_id: number; option_id: number; full_name: string }>()
+  ).results;
 
   const now = Date.now();
   for (const p of pollRows) {
+    const anonymous = !!p.anonymous;
     result.set(p.post_id, {
       id: p.id,
       question: p.question,
       multiple: !!p.multiple,
       lock_vote: !!p.lock_vote,
+      anonymous,
       ends_at: p.ends_at,
       ended: !!p.ends_at && new Date(p.ends_at).getTime() <= now,
-      options: optRows.filter((o) => o.poll_id === p.id).map((o) => ({ id: o.id, text: o.text, votes: o.votes })),
+      options: optRows
+        .filter((o) => o.poll_id === p.id)
+        .map((o) => ({
+          id: o.id,
+          text: o.text,
+          votes: o.votes,
+          ...(anonymous
+            ? {}
+            : { voters: voterRows.filter((v) => v.poll_id === p.id && v.option_id === o.id).map((v) => v.full_name) }),
+        })),
       my_votes: myRows.filter((m) => m.poll_id === p.id).map((m) => m.option_id),
     });
   }
@@ -609,7 +632,14 @@ async function addPost(request: Request, env: Env): Promise<Response> {
   const attachmentId = str(body.attachment_id, 64);
   const textPosition = body.text_position === "bottom" ? "bottom" : "top";
 
-  let poll: { question: string; options: string[]; multiple: boolean; lock: boolean; endsAt: string | null } | null = null;
+  let poll: {
+    question: string;
+    options: string[];
+    multiple: boolean;
+    lock: boolean;
+    anonymous: boolean;
+    endsAt: string | null;
+  } | null = null;
   if (body.poll && typeof body.poll === "object") {
     const p = body.poll as Record<string, unknown>;
     const question = str(p.question, 300);
@@ -623,7 +653,14 @@ async function addPost(request: Request, env: Env): Promise<Response> {
       if (Number.isNaN(t) || t <= Date.now()) return json({ error: "Время окончания опроса должно быть в будущем" }, 400);
       endsAt = new Date(t).toISOString();
     }
-    poll = { question, options, multiple: p.multiple === true, lock: p.lock === true, endsAt };
+    poll = {
+      question,
+      options,
+      multiple: p.multiple === true,
+      lock: p.lock === true,
+      anonymous: p.anonymous === true,
+      endsAt,
+    };
   }
   if (!text && !photoId && !attachmentId && !poll) {
     return json({ error: "Напишите текст, добавьте файл или опрос" }, 400);
@@ -654,9 +691,9 @@ async function addPost(request: Request, env: Env): Promise<Response> {
 
   if (poll && postId) {
     const pollResult = await env.DB.prepare(
-      "INSERT INTO polls (post_id, question, multiple, lock_vote, ends_at) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO polls (post_id, question, multiple, lock_vote, anonymous, ends_at) VALUES (?, ?, ?, ?, ?, ?)",
     )
-      .bind(postId, poll.question, poll.multiple ? 1 : 0, poll.lock ? 1 : 0, poll.endsAt)
+      .bind(postId, poll.question, poll.multiple ? 1 : 0, poll.lock ? 1 : 0, poll.anonymous ? 1 : 0, poll.endsAt)
       .run();
     const pollId = pollResult.meta?.last_row_id;
     await env.DB.batch(
