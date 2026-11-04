@@ -49,7 +49,7 @@ const paths: Record<string, ReactElement> = {
   ),
 };
 
-export function TabIcon({ name }: { name: string }) {
+export function TabIcon({ name, color = "#FFFFFF" }: { name: string; color?: string }) {
   return (
     <svg
       aria-hidden="true"
@@ -57,7 +57,7 @@ export function TabIcon({ name }: { name: string }) {
       height="22"
       viewBox="0 0 24 24"
       fill="none"
-      stroke="#FFFFFF"
+      stroke={color}
       strokeWidth="1.6"
       strokeLinecap="round"
       strokeLinejoin="round"

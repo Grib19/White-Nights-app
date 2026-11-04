@@ -119,7 +119,7 @@ export function App() {
                 }
               >
                 <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <TabIcon name={key} />
+                  <TabIcon name={key} color={tab === key ? colors.navy : colors.white} />
                   {label}
                 </span>
               </button>
