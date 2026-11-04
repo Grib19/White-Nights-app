@@ -110,6 +110,7 @@ export function App() {
             {tabList.map(([key, label]) => (
               <button
                 key={key}
+                className="nav-tab"
                 onClick={() => setTab(key)}
                 disabled={tab === key}
                 style={
