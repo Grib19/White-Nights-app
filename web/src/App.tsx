@@ -15,10 +15,18 @@ type Pending = User;
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [tab, setTab] = useState<Tab>("profile");
+  const [tab, setTab] = useState<Tab>("feed");
   const [mode, setMode] = useState<Mode>("login");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // На широком экране меню слева (как во ВКонтакте), на телефоне — полоской сверху
+  const [wide, setWide] = useState(() => window.innerWidth >= 760);
+  useEffect(() => {
+    const onResize = () => setWide(window.innerWidth >= 760);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   const isCommittee = !!user && user.status === "approved" && COMMITTEE_ROLES.includes(user.role);
 
@@ -51,7 +59,7 @@ export function App() {
         if (status === 200) {
           setToken(data.token);
           setUser(data.user);
-          setTab("profile");
+          setTab("feed");
         } else setMessage(data.error ?? "Ошибка входа");
       }
     } catch {
@@ -69,8 +77,8 @@ export function App() {
 
   if (user) {
     const tabList: [Tab, string][] = [
-      ["profile", "Профиль"],
       ["feed", "Лента"],
+      ["profile", "Профиль"],
       ["music", "Музыка"],
       ["members", "Участники"],
       ["info", "Информация"],
@@ -90,25 +98,39 @@ export function App() {
           <button onClick={logout} style={{ ...tabButton(false), cursor: "pointer" }}>Выйти</button>
         </header>
 
-        <nav style={tabs}>
-          {tabList.map(([key, label]) => (
-            <button
-              key={key}
-              onClick={() => setTab(key)}
-              disabled={tab === key}
-              style={tabButton(tab === key)}
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
+        <div style={wide ? { display: "flex", gap: 20, alignItems: "flex-start" } : undefined}>
+          <nav
+            style={
+              wide
+                ? { width: 220, flexShrink: 0, position: "sticky", top: 16, display: "flex", flexDirection: "column", gap: 8 }
+                : tabs
+            }
+          >
+            {tabList.map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                disabled={tab === key}
+                style={
+                  wide
+                    ? { ...tabButton(tab === key), width: "100%", textAlign: "left", fontSize: 16, padding: "10px 14px" }
+                    : tabButton(tab === key)
+                }
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
 
-        {tab === "profile" && <ProfilePage user={user} />}
-        {tab === "members" && <MembersPage viewer={user} />}
-        {tab === "info" && <InfoPage viewer={user} />}
-        {tab === "music" && <MusicPage viewer={user} />}
-        {tab === "feed" && <FeedPage viewer={user} />}
-        {tab === "committee" && isCommittee && <CommitteePage />}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {tab === "feed" && <FeedPage viewer={user} />}
+            {tab === "profile" && <ProfilePage user={user} />}
+            {tab === "members" && <MembersPage viewer={user} />}
+            {tab === "info" && <InfoPage viewer={user} />}
+            {tab === "music" && <MusicPage viewer={user} />}
+            {tab === "committee" && isCommittee && <CommitteePage />}
+          </div>
+        </div>
       </main>
     );
   }
