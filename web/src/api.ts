@@ -112,6 +112,37 @@ export async function loadAudio(id: string): Promise<string | null> {
   return URL.createObjectURL(await res.blob());
 }
 
+// Любой файл для поста (до 20 МБ). Возвращает id вложения.
+export async function uploadAttachment(file: File): Promise<{ ok: boolean; id?: string; error?: string }> {
+  const res = await fetch(baseUrl() + "/api/attachments", {
+    method: "POST",
+    headers: {
+      ...authHeaders(),
+      "content-type": file.type || "application/octet-stream",
+      "x-file-name": encodeURIComponent(file.name),
+    },
+    body: file,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 201) return { ok: true, id: data.id };
+  return { ok: false, error: data.error ?? "Не удалось загрузить файл" };
+}
+
+// Скачивание вложения: грузим с заголовком входа и сохраняем файл под его названием
+export async function downloadAttachment(id: string, name: string): Promise<string | null> {
+  const res = await fetch(baseUrl() + `/api/attachments/${id}`, { headers: authHeaders() });
+  if (!res.ok) return "Не удалось скачать файл";
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return null;
+}
+
 // Картинка с защищённого адреса: браузер сам не передаёт заголовок входа, поэтому грузим через fetch
 export async function loadImage(id: string): Promise<string | null> {
   const res = await fetch(baseUrl() + `/api/files/${id}`, { headers: authHeaders() });

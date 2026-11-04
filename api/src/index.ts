@@ -27,7 +27,7 @@ const enc = new TextEncoder();
 const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization, x-song-title, x-song-author",
+  "access-control-allow-headers": "content-type, authorization, x-song-title, x-song-author, x-file-name",
 };
 
 function json(data: unknown, status = 200): Response {
@@ -515,18 +515,89 @@ async function getFile(request: Request, env: Env, id: string): Promise<Response
 }
 
 // ---------- лента новостей ----------
-// Любой подтверждённый участник пишет пост (текст и/или фото).
+// Любой подтверждённый участник пишет пост: текст, фото, любой файл и/или опрос.
 // Удалить может автор или комсостав.
+
+const MAX_ATTACHMENT = 20 * 1024 * 1024;
+const MAX_POLL_OPTIONS = 10;
+
+interface PollRow {
+  id: number;
+  post_id: number;
+  question: string;
+  multiple: number;
+  lock_vote: number;
+  ends_at: string | null;
+}
+
+// Опросы для списка постов: варианты, число голосов и голоса самого участника
+async function loadPolls(env: Env, postIds: number[], userId: number): Promise<Map<number, unknown>> {
+  const result = new Map<number, unknown>();
+  if (postIds.length === 0) return result;
+  const marks = postIds.map(() => "?").join(",");
+  const pollRows = (
+    await env.DB.prepare(
+      `SELECT id, post_id, question, multiple, lock_vote, ends_at FROM polls WHERE post_id IN (${marks})`,
+    )
+      .bind(...postIds)
+      .all<PollRow>()
+  ).results;
+  if (pollRows.length === 0) return result;
+
+  const pollIds = pollRows.map((p) => p.id);
+  const pMarks = pollIds.map(() => "?").join(",");
+  const optRows = (
+    await env.DB.prepare(
+      `SELECT o.id, o.poll_id, o.text,
+              (SELECT COUNT(*) FROM poll_votes v WHERE v.option_id = o.id) AS votes
+         FROM poll_options o WHERE o.poll_id IN (${pMarks}) ORDER BY o.poll_id, o.position, o.id`,
+    )
+      .bind(...pollIds)
+      .all<{ id: number; poll_id: number; text: string; votes: number }>()
+  ).results;
+  const myRows = (
+    await env.DB.prepare(`SELECT poll_id, option_id FROM poll_votes WHERE user_id = ? AND poll_id IN (${pMarks})`)
+      .bind(userId, ...pollIds)
+      .all<{ poll_id: number; option_id: number }>()
+  ).results;
+
+  const now = Date.now();
+  for (const p of pollRows) {
+    result.set(p.post_id, {
+      id: p.id,
+      question: p.question,
+      multiple: !!p.multiple,
+      lock_vote: !!p.lock_vote,
+      ends_at: p.ends_at,
+      ended: !!p.ends_at && new Date(p.ends_at).getTime() <= now,
+      options: optRows.filter((o) => o.poll_id === p.id).map((o) => ({ id: o.id, text: o.text, votes: o.votes })),
+      my_votes: myRows.filter((m) => m.poll_id === p.id).map((m) => m.option_id),
+    });
+  }
+  return result;
+}
 
 async function listPosts(request: Request, env: Env): Promise<Response> {
   const viewer = await approvedUser(request, env);
   if (!viewer) return json({ error: "Нужен вход" }, 401);
-  const rows = await env.DB.prepare(
-    `SELECT p.id, p.body, p.photo_id, p.created_at, p.author_id, u.full_name AS author_name
-       FROM posts p JOIN users u ON u.id = p.author_id
-      ORDER BY p.created_at DESC, p.id DESC LIMIT 100`,
-  ).all();
-  return json({ posts: rows.results, viewer_id: viewer.id, viewer_committee: isCommittee(viewer) });
+  const rows = (
+    await env.DB.prepare(
+      `SELECT p.id, p.body, p.photo_id, p.text_position, p.attachment_id, p.attachment_name,
+              p.created_at, p.author_id, u.full_name AS author_name
+         FROM posts p JOIN users u ON u.id = p.author_id
+        ORDER BY p.created_at DESC, p.id DESC LIMIT 100`,
+    ).all()
+  ).results as Array<{ id: number }>;
+  const polls = await loadPolls(
+    env,
+    rows.map((r) => r.id),
+    viewer.id,
+  );
+  return json({
+    posts: rows.map((r) => ({ ...r, poll: polls.get(r.id) ?? null })),
+    viewer_id: viewer.id,
+    viewer_committee: isCommittee(viewer),
+  });
 }
 
 async function addPost(request: Request, env: Env): Promise<Response> {
@@ -535,7 +606,28 @@ async function addPost(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const text = str(body.body, 2000);
   const photoId = str(body.photo_id, 64);
-  if (!text && !photoId) return json({ error: "Напишите текст или добавьте фото" }, 400);
+  const attachmentId = str(body.attachment_id, 64);
+  const textPosition = body.text_position === "bottom" ? "bottom" : "top";
+
+  let poll: { question: string; options: string[]; multiple: boolean; lock: boolean; endsAt: string | null } | null = null;
+  if (body.poll && typeof body.poll === "object") {
+    const p = body.poll as Record<string, unknown>;
+    const question = str(p.question, 300);
+    const options = Array.isArray(p.options) ? p.options.map((o) => str(o, 200)).filter(Boolean) : [];
+    if (!question) return json({ error: "Напишите тему опроса" }, 400);
+    if (options.length < 2) return json({ error: "В опросе должно быть не меньше двух вариантов" }, 400);
+    if (options.length > MAX_POLL_OPTIONS) return json({ error: "В опросе не больше 10 вариантов" }, 400);
+    let endsAt: string | null = null;
+    if (p.ends_at) {
+      const t = Date.parse(String(p.ends_at));
+      if (Number.isNaN(t) || t <= Date.now()) return json({ error: "Время окончания опроса должно быть в будущем" }, 400);
+      endsAt = new Date(t).toISOString();
+    }
+    poll = { question, options, multiple: p.multiple === true, lock: p.lock === true, endsAt };
+  }
+  if (!text && !photoId && !attachmentId && !poll) {
+    return json({ error: "Напишите текст, добавьте файл или опрос" }, 400);
+  }
 
   if (photoId) {
     const file = await env.FILES.getWithMetadata<{ uploadedBy: number; contentType: string }>(`file:${photoId}`);
@@ -544,20 +636,136 @@ async function addPost(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  const result = await env.DB.prepare("INSERT INTO posts (author_id, body, photo_id) VALUES (?, ?, ?)")
-    .bind(user.id, text, photoId || null)
+  let attachmentName: string | null = null;
+  if (attachmentId) {
+    if (!/^[A-Za-z0-9_-]{10,64}$/.test(attachmentId)) return json({ error: "Файл не найден" }, 400);
+    const att = await env.FILES.getWithMetadata<{ uploadedBy: number; name: string }>(`att:${attachmentId}`);
+    if (!att.value || att.metadata?.uploadedBy !== user.id) return json({ error: "Файл не найден" }, 400);
+    attachmentName = att.metadata.name;
+  }
+
+  const result = await env.DB.prepare(
+    `INSERT INTO posts (author_id, body, photo_id, text_position, attachment_id, attachment_name)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(user.id, text, photoId || null, textPosition, attachmentId || null, attachmentName)
     .run();
-  return json({ ok: true, id: result.meta?.last_row_id }, 201);
+  const postId = result.meta?.last_row_id;
+
+  if (poll && postId) {
+    const pollResult = await env.DB.prepare(
+      "INSERT INTO polls (post_id, question, multiple, lock_vote, ends_at) VALUES (?, ?, ?, ?, ?)",
+    )
+      .bind(postId, poll.question, poll.multiple ? 1 : 0, poll.lock ? 1 : 0, poll.endsAt)
+      .run();
+    const pollId = pollResult.meta?.last_row_id;
+    await env.DB.batch(
+      poll.options.map((optText, i) =>
+        env.DB.prepare("INSERT INTO poll_options (poll_id, text, position) VALUES (?, ?, ?)").bind(pollId, optText, i),
+      ),
+    );
+  }
+  return json({ ok: true, id: postId }, 201);
 }
 
 async function deletePost(request: Request, env: Env, id: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const post = await env.DB.prepare("SELECT author_id FROM posts WHERE id = ?").bind(id).first<{ author_id: number }>();
+  const post = await env.DB.prepare("SELECT author_id, attachment_id FROM posts WHERE id = ?")
+    .bind(id)
+    .first<{ author_id: number; attachment_id: string | null }>();
   if (!post) return json({ error: "Пост не найден" }, 404);
   if (post.author_id !== user.id && !isCommittee(user)) return json({ error: "Нет доступа" }, 403);
+
+  await env.DB.prepare("DELETE FROM poll_votes WHERE poll_id IN (SELECT id FROM polls WHERE post_id = ?)").bind(id).run();
+  await env.DB.prepare("DELETE FROM poll_options WHERE poll_id IN (SELECT id FROM polls WHERE post_id = ?)").bind(id).run();
+  await env.DB.prepare("DELETE FROM polls WHERE post_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM posts WHERE id = ?").bind(id).run();
+  if (post.attachment_id) await env.FILES.delete(`att:${post.attachment_id}`);
   return json({ ok: true });
+}
+
+// Голос в опросе: одиночный выбор заменяет прошлый голос, множественный — переключает вариант.
+// «Запретить отмену голоса»: после голоса изменить его нельзя.
+async function votePoll(request: Request, env: Env, pollId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const optionId = Number(body.option_id);
+
+  const poll = await env.DB.prepare("SELECT id, multiple, lock_vote, ends_at FROM polls WHERE id = ?")
+    .bind(pollId)
+    .first<{ id: number; multiple: number; lock_vote: number; ends_at: string | null }>();
+  if (!poll) return json({ error: "Опрос не найден" }, 404);
+  if (poll.ends_at && new Date(poll.ends_at).getTime() <= Date.now()) {
+    return json({ error: "Голосование завершено" }, 400);
+  }
+  const option = await env.DB.prepare("SELECT id FROM poll_options WHERE id = ? AND poll_id = ?")
+    .bind(optionId, pollId)
+    .first();
+  if (!option) return json({ error: "Вариант не найден" }, 400);
+
+  const mine = (
+    await env.DB.prepare("SELECT option_id FROM poll_votes WHERE poll_id = ? AND user_id = ?")
+      .bind(pollId, user.id)
+      .all<{ option_id: number }>()
+  ).results;
+  const has = mine.some((m) => m.option_id === optionId);
+
+  if (poll.lock_vote) {
+    // Отмена голоса запрещена; при одиночном выборе смена варианта — тоже отмена прошлого
+    if (has) return json({ error: "Голос нельзя отменить" }, 403);
+    if (!poll.multiple && mine.length > 0) return json({ error: "Голос нельзя изменить" }, 403);
+  }
+
+  if (has) {
+    await env.DB.prepare("DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ? AND option_id = ?")
+      .bind(pollId, user.id, optionId)
+      .run();
+  } else {
+    if (!poll.multiple) {
+      await env.DB.prepare("DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ?").bind(pollId, user.id).run();
+    }
+    await env.DB.prepare("INSERT OR IGNORE INTO poll_votes (poll_id, option_id, user_id) VALUES (?, ?, ?)")
+      .bind(pollId, optionId, user.id)
+      .run();
+  }
+  return json({ ok: true });
+}
+
+// Любой файл для поста: до 20 МБ, хранится в KV, скачивается по ссылке
+async function uploadAttachment(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const name = decodeHeader(request.headers.get("x-file-name"), 200);
+  if (!name) return json({ error: "Не указано имя файла" }, 400);
+  const type =
+    (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase() || "application/octet-stream";
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength === 0) return json({ error: "Пустой файл" }, 400);
+  if (bytes.byteLength > MAX_ATTACHMENT) return json({ error: "Файл больше 20 МБ" }, 413);
+
+  const id = randomToken(16);
+  await env.FILES.put(`att:${id}`, bytes, { metadata: { contentType: type, name, uploadedBy: user.id } });
+  return json({ id, name }, 201);
+}
+
+async function getAttachment(request: Request, env: Env, id: string): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  if (!/^[A-Za-z0-9_-]{10,64}$/.test(id)) return json({ error: "Не найдено" }, 404);
+  const file = await env.FILES.getWithMetadata<{ contentType: string; name: string }>(`att:${id}`, "arrayBuffer");
+  if (!file.value) return json({ error: "Не найдено" }, 404);
+  const name = file.metadata?.name ?? "file";
+  return new Response(file.value, {
+    headers: {
+      "content-type": file.metadata?.contentType ?? "application/octet-stream",
+      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
+      "cache-control": "private, max-age=3600",
+      "x-content-type-options": "nosniff",
+      ...CORS,
+    },
+  });
 }
 
 // ---------- песни ----------
@@ -681,6 +889,11 @@ export default {
       if (method === "POST" && path === "/api/posts") return await addPost(request, env);
       const postMatch = path.match(/^\/api\/posts\/(\d+)$/);
       if (method === "DELETE" && postMatch) return await deletePost(request, env, Number(postMatch[1]));
+      const voteMatch = path.match(/^\/api\/polls\/(\d+)\/vote$/);
+      if (method === "POST" && voteMatch) return await votePoll(request, env, Number(voteMatch[1]));
+      if (method === "POST" && path === "/api/attachments") return await uploadAttachment(request, env);
+      const attMatch = path.match(/^\/api\/attachments\/([A-Za-z0-9_-]+)$/);
+      if (method === "GET" && attMatch) return await getAttachment(request, env, attMatch[1]);
 
       const songAudioMatch = path.match(/^\/api\/songs\/([A-Za-z0-9_-]+)\/audio$/);
       if (method === "GET" && songAudioMatch) return await getSongAudio(request, env, songAudioMatch[1]);
