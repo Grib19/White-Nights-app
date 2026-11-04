@@ -43,10 +43,9 @@ export function FeedPage({ viewer }: { viewer: User }) {
   // Новый пост
   const [body, setBody] = useState("");
   const [textTop, setTextTop] = useState(true);
-  const [photo, setPhoto] = useState<File | null>(null);
-  const [photoKey, setPhotoKey] = useState(0);
-  const [attachment, setAttachment] = useState<File | null>(null);
-  const [attachmentKey, setAttachmentKey] = useState(0);
+  // Одна кнопка «Прикрепить»: картинка показывается в посте, любой другой файл — ссылкой на скачивание
+  const [attached, setAttached] = useState<File | null>(null);
+  const [attachedKey, setAttachedKey] = useState(0);
   const [pollOn, setPollOn] = useState(false);
   const [question, setQuestion] = useState("");
   const [options, setOptions] = useState<string[]>(["", ""]);
@@ -56,8 +55,9 @@ export function FeedPage({ viewer }: { viewer: User }) {
   const [endsAt, setEndsAt] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const hasMedia = !!photo || !!attachment || pollOn;
-  const canPublish = !!body.trim() || !!photo || !!attachment || (pollOn && !!question.trim());
+  const attachedIsImage = !!attached && attached.type.startsWith("image/");
+  const hasMedia = !!attached || pollOn;
+  const canPublish = !!body.trim() || !!attached || (pollOn && !!question.trim());
 
   async function load() {
     const { status, data } = await request("/api/posts");
@@ -73,10 +73,8 @@ export function FeedPage({ viewer }: { viewer: User }) {
 
   function resetComposer() {
     setBody("");
-    setPhoto(null);
-    setPhotoKey((k) => k + 1);
-    setAttachment(null);
-    setAttachmentKey((k) => k + 1);
+    setAttached(null);
+    setAttachedKey((k) => k + 1);
     setPollOn(false);
     setQuestion("");
     setOptions(["", ""]);
@@ -92,14 +90,13 @@ export function FeedPage({ viewer }: { viewer: User }) {
     setMessage("");
     try {
       let photoId: string | undefined;
-      if (photo) {
-        const up = await uploadFile(photo);
+      let attachmentId: string | undefined;
+      if (attached && attachedIsImage) {
+        const up = await uploadFile(attached);
         if (!up.ok) return setMessage(up.error ?? "Не удалось загрузить фото");
         photoId = up.id;
-      }
-      let attachmentId: string | undefined;
-      if (attachment) {
-        const up = await uploadAttachment(attachment);
+      } else if (attached) {
+        const up = await uploadAttachment(attached);
         if (!up.ok) return setMessage(up.error ?? "Не удалось загрузить файл");
         attachmentId = up.id;
       }
@@ -163,19 +160,21 @@ export function FeedPage({ viewer }: { viewer: User }) {
 
         <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center", marginBottom: 12 }}>
           <label style={linkLabel}>
-            Фото
-            <input key={photoKey} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />
-          </label>
-          <label style={linkLabel}>
-            Файл
-            <input key={attachmentKey} type="file" style={{ display: "none" }} onChange={(e) => setAttachment(e.target.files?.[0] ?? null)} />
+            Прикрепить
+            <input key={attachedKey} type="file" style={{ display: "none" }} onChange={(e) => setAttached(e.target.files?.[0] ?? null)} />
           </label>
           <button type="button" onClick={() => setPollOn((v) => !v)} style={linkButton}>
             {pollOn ? "Убрать опрос" : "Опрос"}
           </button>
         </div>
-        {photo && <div style={{ color: colors.gray, fontSize: 14, marginBottom: 6 }}>Фото: {photo.name}</div>}
-        {attachment && <div style={{ color: colors.gray, fontSize: 14, marginBottom: 6 }}>Файл: {attachment.name}</div>}
+        {attached && (
+          <div style={{ color: colors.gray, fontSize: 14, marginBottom: 6 }}>
+            Прикреплено: {attached.name}{" "}
+            <button type="button" onClick={() => { setAttached(null); setAttachedKey((k) => k + 1); }} style={linkButton}>
+              убрать
+            </button>
+          </div>
+        )}
 
         {pollOn && (
           <div style={{ background: colors.field, borderRadius: 12, padding: 12, marginBottom: 12 }}>
