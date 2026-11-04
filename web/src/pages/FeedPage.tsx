@@ -33,7 +33,27 @@ interface Post {
   author_id: number;
   author_name: string;
   poll: Poll | null;
+  reactions: Reaction[];
+  comments_count: number;
 }
+
+interface Reaction {
+  emoji: string;
+  count: number;
+  mine: boolean;
+}
+
+interface Comment {
+  id: number;
+  body: string;
+  created_at: string;
+  author_id: number;
+  author_name: string;
+  reactions: Reaction[];
+}
+
+// Эмодзи для реакций: одна реакция от участника на пост или комментарий
+const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🔥", "👏", "🙏"];
 
 const MAX_OPTIONS = 10;
 
@@ -271,6 +291,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
 }
 
 function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDelete: boolean; onDelete: () => void; onChanged: () => void }) {
+  const [showComments, setShowComments] = useState(false);
   const text = post.body ? <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.5, marginTop: 8 }}>{post.body}</div> : null;
   const media = (
     <>
@@ -297,16 +318,137 @@ function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDel
           {media}
         </>
       )}
-      {canDelete && (
-        <div style={{ marginTop: 8 }}>
+      <ReactionBar
+        reactions={post.reactions}
+        onPick={async (emoji) => {
+          await request("/api/reactions", "POST", { target_type: "post", target_id: post.id, emoji });
+          onChanged();
+        }}
+      />
+      <div style={{ marginTop: 8, display: "flex", gap: 14, alignItems: "center" }}>
+        <button type="button" onClick={() => setShowComments((v) => !v)} style={linkButton}>
+          {showComments ? "Скрыть комментарии" : `Комментарии${post.comments_count ? ` (${post.comments_count})` : ""}`}
+        </button>
+        {canDelete && (
           <button
             onClick={onDelete}
             style={{ background: "none", border: "none", color: colors.gray, textDecoration: "underline", cursor: "pointer", padding: 0, fontSize: 14 }}
           >
             Удалить
           </button>
+        )}
+      </div>
+      {showComments && <CommentsBlock postId={post.id} onChanged={onChanged} />}
+    </div>
+  );
+}
+
+// Полоска эмодзи под постом или комментарием: число реакций и подсветка своей
+function ReactionBar({ reactions, onPick }: { reactions: Reaction[]; onPick: (emoji: string) => void | Promise<void> }) {
+  const byEmoji = new Map(reactions.map((r) => [r.emoji, r]));
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+      {REACTION_EMOJIS.map((emoji) => {
+        const r = byEmoji.get(emoji);
+        const mine = !!r?.mine;
+        return (
+          <button
+            key={emoji}
+            type="button"
+            onClick={() => onPick(emoji)}
+            className="nav-tab"
+            style={{
+              padding: "2px 10px",
+              borderRadius: 999,
+              border: mine ? `2px solid ${colors.navy}` : `1px solid ${colors.field}`,
+              background: mine ? colors.yellow : colors.field,
+              color: colors.navy,
+              cursor: "pointer",
+              fontSize: 15,
+            }}
+          >
+            {emoji}
+            {r && r.count > 0 ? ` ${r.count}` : ""}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Комментарии к посту: список, добавление, реакции и удаление
+function CommentsBlock({ postId, onChanged }: { postId: number; onChanged: () => void }) {
+  const [comments, setComments] = useState<Comment[]>([]);
+  const [committee, setCommittee] = useState(false);
+  const [viewerId, setViewerId] = useState<number | null>(null);
+  const [text, setText] = useState("");
+  const [message, setMessage] = useState("");
+
+  async function load() {
+    const { status, data } = await request(`/api/posts/${postId}/comments`);
+    if (status === 200) {
+      setComments(data.comments ?? []);
+      setCommittee(!!data.viewer_committee);
+      setViewerId(data.viewer_id ?? null);
+    } else setMessage(data.error ?? "Не удалось загрузить комментарии");
+  }
+
+  useEffect(() => {
+    load();
+  }, [postId]);
+
+  async function send(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const { status, data } = await request(`/api/posts/${postId}/comments`, "POST", { body: text.trim() });
+    if (status === 201) {
+      setText("");
+      await load();
+      onChanged();
+    } else setMessage(data.error ?? "Не удалось отправить");
+  }
+
+  async function remove(id: number) {
+    if (!window.confirm("Удалить комментарий?")) return;
+    const { status, data } = await request(`/api/comments/${id}`, "DELETE");
+    if (status === 200) {
+      await load();
+      onChanged();
+    } else setMessage(data.error ?? "Не удалось удалить");
+  }
+
+  async function react(id: number, emoji: string) {
+    await request("/api/reactions", "POST", { target_type: "comment", target_id: id, emoji });
+    await load();
+  }
+
+  return (
+    <div style={{ marginTop: 10, borderTop: `1px solid ${colors.field}`, paddingTop: 10 }}>
+      {comments.map((c) => (
+        <div key={c.id} style={{ marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 14 }}>
+            <b>{c.author_name}</b>
+            <span style={{ color: colors.gray, fontSize: 12 }}>{new Date(c.created_at).toLocaleString("ru-RU")}</span>
+          </div>
+          <div style={{ whiteSpace: "pre-wrap", marginTop: 2 }}>{c.body}</div>
+          <ReactionBar reactions={c.reactions} onPick={(emoji) => react(c.id, emoji)} />
+          {(committee || c.author_id === viewerId) && (
+            <button
+              type="button"
+              onClick={() => remove(c.id)}
+              style={{ background: "none", border: "none", color: colors.gray, textDecoration: "underline", cursor: "pointer", padding: 0, fontSize: 13, marginTop: 4 }}
+            >
+              Удалить
+            </button>
+          )}
         </div>
-      )}
+      ))}
+      <form onSubmit={send} style={{ display: "flex", gap: 8 }}>
+        <input style={{ ...input, margin: 0 }} placeholder="Написать комментарий" value={text} onChange={(e) => setText(e.target.value)} maxLength={1000} />
+        <button style={{ ...button, width: "auto", padding: "8px 16px" }} type="submit" disabled={!text.trim()}>
+          Отправить
+        </button>
+      </form>
+      {message && <div style={{ color: "#b00020", fontSize: 14 }}>{message}</div>}
     </div>
   );
 }

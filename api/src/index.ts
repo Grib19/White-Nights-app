@@ -638,7 +638,8 @@ async function listPosts(request: Request, env: Env): Promise<Response> {
   const rows = (
     await env.DB.prepare(
       `SELECT p.id, p.body, p.photo_id, p.text_position, p.attachment_id, p.attachment_name,
-              p.created_at, p.author_id, u.full_name AS author_name
+              p.created_at, p.author_id, u.full_name AS author_name,
+              (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comments_count
          FROM posts p JOIN users u ON u.id = p.author_id
         WHERE p.section = ?
         ORDER BY p.created_at DESC, p.id DESC LIMIT 100`,
@@ -651,8 +652,14 @@ async function listPosts(request: Request, env: Env): Promise<Response> {
     rows.map((r) => r.id),
     viewer.id,
   );
+  const reactions = await loadReactions(
+    env,
+    "post",
+    rows.map((r) => r.id),
+    viewer.id,
+  );
   return json({
-    posts: rows.map((r) => ({ ...r, poll: polls.get(r.id) ?? null })),
+    posts: rows.map((r) => ({ ...r, poll: polls.get(r.id) ?? null, reactions: reactions.get(r.id) ?? [] })),
     viewer_id: viewer.id,
     viewer_committee: isCommittee(viewer),
     can_post_important: await canPostImportant(env, viewer),
@@ -757,6 +764,9 @@ async function deletePost(request: Request, env: Env, id: number): Promise<Respo
   await env.DB.prepare("DELETE FROM poll_votes WHERE poll_id IN (SELECT id FROM polls WHERE post_id = ?)").bind(id).run();
   await env.DB.prepare("DELETE FROM poll_options WHERE poll_id IN (SELECT id FROM polls WHERE post_id = ?)").bind(id).run();
   await env.DB.prepare("DELETE FROM polls WHERE post_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM reactions WHERE target_type = 'comment' AND target_id IN (SELECT id FROM comments WHERE post_id = ?)").bind(id).run();
+  await env.DB.prepare("DELETE FROM comments WHERE post_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM reactions WHERE target_type = 'post' AND target_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM posts WHERE id = ?").bind(id).run();
   if (post.attachment_id) await env.FILES.delete(`att:${post.attachment_id}`);
   return json({ ok: true });
@@ -843,6 +853,131 @@ async function getAttachment(request: Request, env: Env, id: string): Promise<Re
       ...CORS,
     },
   });
+}
+
+// ---------- реакции и комментарии ----------
+
+const EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🔥", "👏", "🙏"];
+
+interface ReactionSummary {
+  emoji: string;
+  count: number;
+  mine: boolean;
+}
+
+// Реакции для набора постов или комментариев: сколько каждого эмодзи и поставил ли их сам участник
+async function loadReactions(
+  env: Env,
+  type: "post" | "comment",
+  ids: number[],
+  userId: number,
+): Promise<Map<number, ReactionSummary[]>> {
+  const result = new Map<number, ReactionSummary[]>();
+  if (ids.length === 0) return result;
+  const marks = ids.map(() => "?").join(",");
+  const rows = (
+    await env.DB.prepare(
+      `SELECT target_id, emoji, COUNT(*) AS count,
+              SUM(CASE WHEN user_id = ? THEN 1 ELSE 0 END) AS mine
+         FROM reactions WHERE target_type = ? AND target_id IN (${marks})
+        GROUP BY target_id, emoji ORDER BY count DESC`,
+    )
+      .bind(userId, type, ...ids)
+      .all<{ target_id: number; emoji: string; count: number; mine: number }>()
+  ).results;
+  for (const r of rows) {
+    const list = result.get(r.target_id) ?? [];
+    list.push({ emoji: r.emoji, count: r.count, mine: r.mine > 0 });
+    result.set(r.target_id, list);
+  }
+  return result;
+}
+
+// Поставить эмодзи: повторный нажатие на тот же эмодзи убирает реакцию, другой — заменяет
+async function toggleReaction(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const type = body.target_type === "post" ? "post" : body.target_type === "comment" ? "comment" : null;
+  const id = Number(body.target_id);
+  const emoji = typeof body.emoji === "string" ? body.emoji : "";
+  if (!type || !Number.isInteger(id) || id <= 0) return json({ error: "Неверный объект" }, 400);
+  if (!EMOJIS.includes(emoji)) return json({ error: "Такой реакции нет" }, 400);
+
+  const table = type === "post" ? "posts" : "comments";
+  const exists = await env.DB.prepare(`SELECT id FROM ${table} WHERE id = ?`).bind(id).first();
+  if (!exists) return json({ error: "Не найдено" }, 404);
+
+  const current = await env.DB.prepare(
+    "SELECT emoji FROM reactions WHERE target_type = ? AND target_id = ? AND user_id = ?",
+  )
+    .bind(type, id, user.id)
+    .first<{ emoji: string }>();
+  if (current?.emoji === emoji) {
+    await env.DB.prepare("DELETE FROM reactions WHERE target_type = ? AND target_id = ? AND user_id = ?")
+      .bind(type, id, user.id)
+      .run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO reactions (target_type, target_id, user_id, emoji) VALUES (?, ?, ?, ?)
+       ON CONFLICT(target_type, target_id, user_id) DO UPDATE SET emoji = excluded.emoji`,
+    )
+      .bind(type, id, user.id, emoji)
+      .run();
+  }
+  return json({ ok: true });
+}
+
+async function listComments(request: Request, env: Env, postId: number): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  const rows = (
+    await env.DB.prepare(
+      `SELECT c.id, c.body, c.created_at, c.author_id, u.full_name AS author_name
+         FROM comments c JOIN users u ON u.id = c.author_id
+        WHERE c.post_id = ? ORDER BY c.created_at, c.id`,
+    )
+      .bind(postId)
+      .all()
+  ).results as Array<{ id: number }>;
+  const reactions = await loadReactions(
+    env,
+    "comment",
+    rows.map((r) => r.id),
+    viewer.id,
+  );
+  return json({
+    comments: rows.map((r) => ({ ...r, reactions: reactions.get(r.id) ?? [] })),
+    viewer_id: viewer.id,
+    viewer_committee: isCommittee(viewer),
+  });
+}
+
+async function addComment(request: Request, env: Env, postId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const text = str(body.body, 1000);
+  if (!text) return json({ error: "Напишите комментарий" }, 400);
+  const post = await env.DB.prepare("SELECT id FROM posts WHERE id = ?").bind(postId).first();
+  if (!post) return json({ error: "Пост не найден" }, 404);
+  await env.DB.prepare("INSERT INTO comments (post_id, author_id, body) VALUES (?, ?, ?)")
+    .bind(postId, user.id, text)
+    .run();
+  return json({ ok: true }, 201);
+}
+
+async function deleteComment(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const row = await env.DB.prepare("SELECT author_id FROM comments WHERE id = ?")
+    .bind(id)
+    .first<{ author_id: number }>();
+  if (!row) return json({ error: "Комментарий не найден" }, 404);
+  if (row.author_id !== user.id && !isCommittee(user)) return json({ error: "Нет доступа" }, 403);
+  await env.DB.prepare("DELETE FROM reactions WHERE target_type = 'comment' AND target_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM comments WHERE id = ?").bind(id).run();
+  return json({ ok: true });
 }
 
 // ---------- песни ----------
@@ -964,6 +1099,12 @@ export default {
       if (method === "POST" && path === "/api/songs") return await addSong(request, env);
       if (method === "GET" && path === "/api/posts") return await listPosts(request, env);
       if (method === "POST" && path === "/api/posts") return await addPost(request, env);
+      if (method === "POST" && path === "/api/reactions") return await toggleReaction(request, env);
+      const commentsMatch = path.match(/^\/api\/posts\/(\d+)\/comments$/);
+      if (method === "GET" && commentsMatch) return await listComments(request, env, Number(commentsMatch[1]));
+      if (method === "POST" && commentsMatch) return await addComment(request, env, Number(commentsMatch[1]));
+      const commentMatch = path.match(/^\/api\/comments\/(\d+)$/);
+      if (method === "DELETE" && commentMatch) return await deleteComment(request, env, Number(commentMatch[1]));
       const postMatch = path.match(/^\/api\/posts\/(\d+)$/);
       if (method === "DELETE" && postMatch) return await deletePost(request, env, Number(postMatch[1]));
       const voteMatch = path.match(/^\/api\/polls\/(\d+)\/vote$/);
