@@ -514,6 +514,52 @@ async function getFile(request: Request, env: Env, id: string): Promise<Response
   });
 }
 
+// ---------- лента новостей ----------
+// Любой подтверждённый участник пишет пост (текст и/или фото).
+// Удалить может автор или комсостав.
+
+async function listPosts(request: Request, env: Env): Promise<Response> {
+  const viewer = await approvedUser(request, env);
+  if (!viewer) return json({ error: "Нужен вход" }, 401);
+  const rows = await env.DB.prepare(
+    `SELECT p.id, p.body, p.photo_id, p.created_at, p.author_id, u.full_name AS author_name
+       FROM posts p JOIN users u ON u.id = p.author_id
+      ORDER BY p.created_at DESC, p.id DESC LIMIT 100`,
+  ).all();
+  return json({ posts: rows.results, viewer_id: viewer.id, viewer_committee: isCommittee(viewer) });
+}
+
+async function addPost(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const text = str(body.body, 2000);
+  const photoId = str(body.photo_id, 64);
+  if (!text && !photoId) return json({ error: "Напишите текст или добавьте фото" }, 400);
+
+  if (photoId) {
+    const file = await env.FILES.getWithMetadata<{ uploadedBy: number; contentType: string }>(`file:${photoId}`);
+    if (!file.value || file.metadata?.uploadedBy !== user.id || !file.metadata?.contentType?.startsWith("image/")) {
+      return json({ error: "Фото не найдено" }, 400);
+    }
+  }
+
+  const result = await env.DB.prepare("INSERT INTO posts (author_id, body, photo_id) VALUES (?, ?, ?)")
+    .bind(user.id, text, photoId || null)
+    .run();
+  return json({ ok: true, id: result.meta?.last_row_id }, 201);
+}
+
+async function deletePost(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const post = await env.DB.prepare("SELECT author_id FROM posts WHERE id = ?").bind(id).first<{ author_id: number }>();
+  if (!post) return json({ error: "Пост не найден" }, 404);
+  if (post.author_id !== user.id && !isCommittee(user)) return json({ error: "Нет доступа" }, 403);
+  await env.DB.prepare("DELETE FROM posts WHERE id = ?").bind(id).run();
+  return json({ ok: true });
+}
+
 // ---------- песни ----------
 // Аудио хранится в KV (ключ song:<id>), список и порядок — в таблице songs.
 // Загружать может только комсостав.
@@ -631,6 +677,11 @@ export default {
 
       if (method === "GET" && path === "/api/songs") return await listSongs(request, env);
       if (method === "POST" && path === "/api/songs") return await addSong(request, env);
+      if (method === "GET" && path === "/api/posts") return await listPosts(request, env);
+      if (method === "POST" && path === "/api/posts") return await addPost(request, env);
+      const postMatch = path.match(/^\/api\/posts\/(\d+)$/);
+      if (method === "DELETE" && postMatch) return await deletePost(request, env, Number(postMatch[1]));
+
       const songAudioMatch = path.match(/^\/api\/songs\/([A-Za-z0-9_-]+)\/audio$/);
       if (method === "GET" && songAudioMatch) return await getSongAudio(request, env, songAudioMatch[1]);
       const songMatch = path.match(/^\/api\/songs\/([A-Za-z0-9_-]+)$/);
