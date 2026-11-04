@@ -1,4 +1,4 @@
-// Белые контурные значки для вкладок. Рисуются на тёмной плашке, чтобы были видны на любом фоне кнопки.
+// Белые контурные значки для вкладок.
 import type { ReactElement } from "react";
 
 const paths: Record<string, ReactElement> = {
@@ -51,22 +51,19 @@ const paths: Record<string, ReactElement> = {
 
 export function TabIcon({ name }: { name: string }) {
   return (
-    <span
+    <svg
       aria-hidden="true"
-      style={{
-        width: 32,
-        height: 32,
-        flexShrink: 0,
-        borderRadius: 8,
-        background: "#022342",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-      }}
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="#FFFFFF"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ flexShrink: 0 }}
     >
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        {paths[name]}
-      </svg>
-    </span>
+      {paths[name]}
+    </svg>
   );
 }
