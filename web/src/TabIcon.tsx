@@ -2,6 +2,20 @@
 import type { ReactElement } from "react";
 
 const paths: Record<string, ReactElement> = {
+  // Важное: восклицательный знак в круге
+  important: (
+    <>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5v5.5" />
+      <path d="M12 16.3v.2" />
+    </>
+  ),
+  // Посты: облачко сообщения
+  posts: (
+    <>
+      <path d="M5 6.5h14a1.5 1.5 0 0 1 1.5 1.5v7a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 3v-3H5A1.5 1.5 0 0 1 3.5 15V8A1.5 1.5 0 0 1 5 6.5z" />
+    </>
+  ),
   // Лента: лист с текстом
   feed: (
     <>

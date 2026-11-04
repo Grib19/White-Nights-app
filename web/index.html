@@ -8,9 +8,9 @@
       body { margin: 0; background: #022342; color: #ffffff; font-family: Arial, Helvetica, sans-serif; }
       /* Плавная смена цвета вкладок меню при наведении */
       .nav-tab { transition: background-color 0.25s ease, color 0.25s ease; }
-      .nav-tab svg { transition: stroke 0.25s ease; }
+      .nav-tab svg { transition: stroke 0.25s ease, transform 0.25s ease; transform-origin: center; }
       .nav-tab:hover:not(:disabled) { background: #FFEAAB !important; color: #022342 !important; }
-      .nav-tab:hover:not(:disabled) svg { stroke: #022342; }
+      .nav-tab:hover:not(:disabled) svg { stroke: #022342; transform: scale(1.15); }
     </style>
   </head>
   <body>

@@ -1,6 +1,7 @@
 import { CSSProperties, FormEvent, useEffect, useState } from "react";
 import { User, downloadAttachment, loadImage, request, uploadAttachment, uploadFile } from "../api";
 import { button, card, colors, input, tabButton } from "../styles";
+import { TabIcon } from "../TabIcon";
 
 interface PollOption {
   id: number;
@@ -156,10 +157,16 @@ export function FeedPage({ viewer }: { viewer: User }) {
       <h2>Лента</h2>
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
         <button className="nav-tab" onClick={() => setSection("important")} disabled={section === "important"} style={tabButton(section === "important")}>
-          Важное
+          <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <TabIcon name="important" color={section === "important" ? colors.navy : colors.white} />
+            Важное
+          </span>
         </button>
         <button className="nav-tab" onClick={() => setSection("posts")} disabled={section === "posts"} style={tabButton(section === "posts")}>
-          Посты
+          <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <TabIcon name="posts" color={section === "posts" ? colors.navy : colors.white} />
+            Посты
+          </span>
         </button>
       </div>
 
