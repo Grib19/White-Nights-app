@@ -378,20 +378,13 @@ function PollView({ poll, onVoted }: { poll: Poll; onVoted: () => void }) {
       ) : (
         total > 0 && (
           <div style={{ marginTop: 4 }}>
-            <button type="button" onClick={() => setShowVoters((v) => !v)} style={linkButton}>
-              {showVoters ? "Скрыть, кто проголосовал" : "Кто проголосовал"}
+            <button type="button" onClick={() => setShowVoters(true)} style={linkButton}>
+              Кто проголосовал
             </button>
-            {showVoters &&
-              poll.options
-                .filter((o) => (o.voters ?? []).length > 0)
-                .map((o) => (
-                  <div key={o.id} style={{ fontSize: 14, marginTop: 6 }}>
-                    <b>{o.text}:</b> {(o.voters ?? []).join(", ")}
-                  </div>
-                ))}
           </div>
         )
       )}
+      {showVoters && <VotersModal poll={poll} onClose={() => setShowVoters(false)} />}
       {error && <div style={{ color: "#b00020", fontSize: 14 }}>{error}</div>}
     </div>
   );
@@ -432,3 +425,148 @@ const checkRow: CSSProperties = {
   marginTop: 6,
   color: colors.navy,
 };
+
+// Окно «Кто проголосовал»: вкладки по вариантам, число людей, список с именами
+function VotersModal({ poll, onClose }: { poll: Poll; onClose: () => void }) {
+  const [tab, setTab] = useState<number | null>(null);
+  const names = new Set<string>();
+  poll.options.forEach((o) => (o.voters ?? []).forEach((n) => names.add(n)));
+  const uniqueVoters = names.size;
+  const maxVotes = Math.max(0, ...poll.options.map((o) => o.votes));
+  const shown = poll.options.filter((o) => tab === null || o.id === tab);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(2, 35, 66, 0.7)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 16,
+        zIndex: 1000,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: colors.white,
+          color: colors.navy,
+          borderRadius: 16,
+          width: "100%",
+          maxWidth: 520,
+          maxHeight: "85vh",
+          overflowY: "auto",
+          padding: 20,
+          boxSizing: "border-box",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}>
+          <b style={{ fontSize: 18 }}>{poll.question}</b>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Закрыть"
+            style={{ background: "none", border: "none", fontSize: 26, lineHeight: 1, cursor: "pointer", color: colors.navy }}
+          >
+            ×
+          </button>
+        </div>
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
+          <button type="button" onClick={() => setTab(null)} style={chip(tab === null)}>Все варианты</button>
+          {poll.options.map((o) => (
+            <button key={o.id} type="button" onClick={() => setTab(o.id)} style={chip(tab === o.id)}>
+              {o.text}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 15, marginBottom: 16 }}>
+          Проголосовали <b>{uniqueVoters}</b> {personWord(uniqueVoters)}
+        </div>
+
+        {shown.map((o) => {
+          const share = uniqueVoters ? (o.votes / uniqueVoters) * 100 : 0;
+          const leader = o.votes > 0 && o.votes === maxVotes;
+          const voters = o.voters ?? [];
+          return (
+            <div key={o.id} style={{ marginBottom: 20 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontWeight: 700 }}>
+                <span>{o.text}</span>
+                <span>
+                  {leader && "✓ "}
+                  {share.toFixed(2)} %
+                </span>
+              </div>
+              <div style={{ height: 6, background: colors.field, borderRadius: 3, margin: "6px 0 10px", overflow: "hidden" }}>
+                <div style={{ width: `${share}%`, height: "100%", background: colors.blue }} />
+              </div>
+              {voters.length === 0 ? (
+                <div style={{ fontSize: 14, color: colors.gray }}>Голосов нет</div>
+              ) : (
+                <>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {voters.map((name) => (
+                      <div key={name} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <Avatar name={name} />
+                        <span>{name}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 13, color: colors.gray, marginTop: 6 }}>
+                    {o.votes} {voteWord(o.votes)}
+                  </div>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Avatar({ name }: { name: string }) {
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        width: 32,
+        height: 32,
+        borderRadius: "50%",
+        background: colors.blue,
+        color: colors.navy,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontWeight: 700,
+        fontSize: 14,
+        flexShrink: 0,
+      }}
+    >
+      {name.trim().charAt(0).toUpperCase()}
+    </span>
+  );
+}
+
+// Склонения: 1 человек / 2 человека / 5 человек; 1 голос / 2 голоса / 5 голосов
+function personWord(n: number): string {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m100 >= 11 && m100 <= 14) return "человек";
+  if (m10 === 1) return "человек";
+  if (m10 >= 2 && m10 <= 4) return "человека";
+  return "человек";
+}
+
+function voteWord(n: number): string {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m100 >= 11 && m100 <= 14) return "голосов";
+  if (m10 === 1) return "голос";
+  if (m10 >= 2 && m10 <= 4) return "голоса";
+  return "голосов";
+}
