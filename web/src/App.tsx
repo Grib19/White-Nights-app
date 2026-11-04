@@ -7,6 +7,7 @@ import { MembersPage } from "./pages/MembersPage";
 import { InfoPage } from "./pages/InfoPage";
 import { MusicPage } from "./pages/MusicPage";
 import { FeedPage } from "./pages/FeedPage";
+import { TabIcon } from "./TabIcon";
 
 type Mode = "login" | "register";
 type Tab = "profile" | "feed" | "members" | "info" | "music" | "committee";
@@ -117,7 +118,10 @@ export function App() {
                     : tabButton(tab === key)
                 }
               >
-                {label}
+                <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <TabIcon name={key} />
+                  {label}
+                </span>
               </button>
             ))}
           </nav>
