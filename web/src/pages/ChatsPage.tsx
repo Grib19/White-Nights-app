@@ -362,12 +362,14 @@ function MessageMenu({
   canPin,
   pinned,
   canCopy,
+  canDownload,
   canEdit,
   canDelete,
   onReact,
   onReply,
   onPin,
   onCopy,
+  onDownload,
   onEdit,
   onForward,
   onSelect,
@@ -379,12 +381,14 @@ function MessageMenu({
   canPin: boolean;
   pinned: boolean;
   canCopy: boolean;
+  canDownload: boolean;
   canEdit: boolean;
   canDelete: boolean;
   onReact: (emoji: string) => void;
   onReply: () => void;
   onPin: () => void;
   onCopy: () => void;
+  onDownload: () => void;
   onEdit: () => void;
   onForward: () => void;
   onSelect: () => void;
@@ -428,6 +432,7 @@ function MessageMenu({
           <button onClick={onReply} style={item}>Ответить</button>
           {canPin && <button onClick={onPin} style={item}>{pinned ? "Открепить" : "Закрепить"}</button>}
           {canCopy && <button onClick={onCopy} style={item}>Копировать текст</button>}
+          {canDownload && <button onClick={onDownload} style={item}>Скачать</button>}
           {canEdit && <button onClick={onEdit} style={item}>Изменить</button>}
           <button onClick={onForward} style={item}>Переслать</button>
           <button onClick={onSelect} style={item}>Выделить</button>
@@ -931,6 +936,12 @@ function ChatView({
           canPin={canPin}
           pinned={pinned?.id === menu.msg.id}
           canCopy={!!menu.msg.body}
+          canDownload={!!menu.msg.attachment_id}
+          onDownload={() => {
+            const m = menu.msg;
+            setMenu(null);
+            if (m.attachment_id) downloadAttachment(m.attachment_id, m.attachment_name ?? "file").then((e) => { if (e) setErr(e); });
+          }}
           canEdit={menu.msg.author_id === viewer.id && !menu.msg.attachment_id}
           canDelete={menu.msg.author_id === viewer.id || moderated}
           onReact={(emoji) => react(menu.msg, emoji)}
