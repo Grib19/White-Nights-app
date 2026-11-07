@@ -352,8 +352,8 @@ function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDel
 }
 
 // Полоска эмодзи под постом или комментарием: число реакций и подсветка своей
-// Подсказка «кто поставил» показывается, если держать курсор на реакции 2 секунды
-const HOVER_DELAY_MS = 2000;
+// Подсказка «кто поставил» показывается, если держать курсор на реакции 1 секунду
+const HOVER_DELAY_MS = 1000;
 
 function ReactionBar({ reactions, onPick }: { reactions: Reaction[]; onPick: (emoji: string) => void | Promise<void> }) {
   const byEmoji = new Map(reactions.map((r) => [r.emoji, r]));
