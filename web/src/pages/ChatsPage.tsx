@@ -4,6 +4,9 @@ import { CSSProperties, FormEvent, useEffect, useRef, useState } from "react";
 import * as Ably from "ably";
 import { COMMITTEE_ROLES, User, downloadAttachment, loadAttachmentUrl, request, uploadAttachment } from "../api";
 import { button, card, colors, input } from "../styles";
+
+// Кнопки в строках и шапке не растягиваются на всю ширину
+const inlineButton: CSSProperties = { ...button, width: "auto", whiteSpace: "nowrap" };
 import { ReactionBar } from "./FeedPage";
 import { TabIcon } from "../TabIcon";
 
@@ -165,7 +168,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
         <aside style={{ width: wide ? 300 : "100%", flexShrink: 0, ...card, padding: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
             <b style={{ fontSize: 18 }}>Чаты</b>
-            <button style={button} onClick={() => setShowNew(true)}>+ Новый чат</button>
+            <button style={inlineButton} onClick={() => setShowNew(true)}>+ Новый чат</button>
           </div>
           {notifyState === "default" && (
             <button
@@ -420,7 +423,7 @@ function ChatView({
 
       <div style={{ height: "calc(100vh - 300px)", minHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, padding: "4px 2px" }}>
         {hasMore && (
-          <button onClick={loadOlder} style={{ alignSelf: "center", ...button, padding: "4px 12px", fontSize: 13 }}>
+          <button onClick={loadOlder} style={{ alignSelf: "center", ...inlineButton, padding: "4px 12px", fontSize: 13 }}>
             Загрузить раньше
           </button>
         )}
@@ -509,7 +512,7 @@ function ChatView({
             if (f) attach(f);
           }}
         />
-        <button type="button" onClick={() => fileRef.current?.click()} disabled={busy || !!editing} style={{ ...button, padding: "8px 12px" }}>
+        <button type="button" onClick={() => fileRef.current?.click()} disabled={busy || !!editing} style={{ ...inlineButton, padding: "8px 12px" }}>
           Прикрепить
         </button>
         <textarea
@@ -525,7 +528,7 @@ function ChatView({
           placeholder="Написать сообщение"
           style={{ ...input, flex: 1, resize: "none" }}
         />
-        <button type="submit" style={button} disabled={busy || !text.trim()}>
+        <button type="submit" style={inlineButton} disabled={busy || !text.trim()}>
           {editing ? "Сохранить" : "Отправить"}
         </button>
       </form>
@@ -601,8 +604,8 @@ function NewChatPanel({
   return (
     <div style={{ ...card, width: "min(420px, 100%)", position: "fixed", top: 80, left: "50%", transform: "translateX(-50%)", zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.3)" }}>
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <button style={{ ...button, opacity: mode === "personal" ? 1 : 0.6 }} onClick={() => setMode("personal")}>Личный чат</button>
-        <button style={{ ...button, opacity: mode === "group" ? 1 : 0.6 }} onClick={() => setMode("group")}>Группа</button>
+        <button style={{ ...inlineButton, opacity: mode === "personal" ? 1 : 0.6 }} onClick={() => setMode("personal")}>Личный чат</button>
+        <button style={{ ...inlineButton, opacity: mode === "group" ? 1 : 0.6 }} onClick={() => setMode("group")}>Группа</button>
       </div>
 
       {mode === "personal" ? (
@@ -635,8 +638,8 @@ function NewChatPanel({
 
       {err && <p style={{ color: "#b00020" }}>{err}</p>}
       <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-        <button style={button} onClick={create}>Создать</button>
-        <button style={button} onClick={onClose}>Отмена</button>
+        <button style={inlineButton} onClick={create}>Создать</button>
+        <button style={inlineButton} onClick={onClose}>Отмена</button>
       </div>
     </div>
   );
