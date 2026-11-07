@@ -15,6 +15,10 @@ interface ChatItem {
   kind: string;
   title: string;
   photo_id: string | null;
+  description: string | null;
+  invite_mode: string;
+  edit_mode: string;
+  created_by: number | null;
   last_body: string | null;
   last_kind: string | null;
   last_at: string | null;
@@ -822,6 +826,134 @@ interface Member {
   photo_id: string | null;
 }
 
+// Кто может менять информацию чата (повторяет проверку на сервере)
+function canEditChat(chat: ChatItem, viewer: User): boolean {
+  if (chat.kind === "group") return chat.created_by === viewer.id || chat.edit_mode === "all";
+  if (chat.kind === "general" || chat.kind === "committee") return COMMITTEE_ROLES.includes(viewer.role);
+  return false;
+}
+
+function GearIcon({ color = colors.navy }: { color?: string }) {
+  return (
+    <svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+  );
+}
+
+// Экран «Настройки» чата: фото, название, описание и права (для группы)
+function ChatSettingsView({
+  chat,
+  viewer,
+  onBack,
+  onSaved,
+}: {
+  chat: ChatItem;
+  viewer: User;
+  onBack: () => void;
+  onSaved: () => void;
+}) {
+  const isGroup = chat.kind === "group";
+  const isCreator = chat.created_by === viewer.id;
+  const [title, setTitle] = useState(chat.title);
+  const [description, setDescription] = useState(chat.description ?? "");
+  const [inviteMode, setInviteMode] = useState(chat.invite_mode);
+  const [editMode, setEditMode] = useState(chat.edit_mode);
+  const [err, setErr] = useState("");
+  const [saving, setSaving] = useState(false);
+  const photoRef = useRef<HTMLInputElement>(null);
+
+  async function setPhoto(file: File) {
+    setErr("");
+    const up = await uploadFile(file);
+    if (!up.ok || !up.id) return setErr(up.error ?? "Не удалось загрузить фото");
+    const { status, data } = await request(`/api/chats/${chat.id}/photo`, "PUT", { photo_id: up.id });
+    if (status === 200) onSaved();
+    else setErr(data.error ?? "Не удалось сменить фото");
+  }
+
+  async function save() {
+    setErr("");
+    if (isGroup && !title.trim()) return setErr("Введите название группы");
+    setSaving(true);
+    const body: Record<string, string> = { description };
+    if (isGroup) body.title = title.trim();
+    if (isGroup && isCreator) {
+      body.invite_mode = inviteMode;
+      body.edit_mode = editMode;
+    }
+    const { status, data } = await request(`/api/chats/${chat.id}/settings`, "PUT", body);
+    setSaving(false);
+    if (status === 200) onSaved();
+    else setErr(data.error ?? "Не удалось сохранить");
+  }
+
+  const rightsSelect = (value: string, onChange: (v: string) => void) => (
+    <select
+      style={{ ...input, marginBottom: 14 }}
+      value={value}
+      disabled={!isCreator}
+      onChange={(e) => onChange(e.target.value)}
+    >
+      <option value="all">Все участники</option>
+      <option value="creator">Только создатель</option>
+    </select>
+  );
+
+  return (
+    <div style={{ ...card, width: "min(460px, 100%)", maxHeight: "85vh", overflowY: "auto", position: "fixed", top: 60, left: "50%", transform: "translateX(-50%)", zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.3)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <button onClick={onBack} style={{ ...linkStyle, fontSize: 22, color: colors.navy }} aria-label="Назад">←</button>
+        <span style={{ fontSize: 18, fontWeight: "bold" }}>Настройки</span>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 14 }}>
+        <ChatAvatar photoId={chat.photo_id} title={chat.title} size={100} />
+        {(isGroup || chat.kind === "general" || chat.kind === "committee") && (
+          <>
+            <input ref={photoRef} type="file" accept="image/*" hidden onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) setPhoto(f);
+              if (photoRef.current) photoRef.current.value = "";
+            }} />
+            <button onClick={() => photoRef.current?.click()} style={{ ...linkStyle, color: colors.blue, fontSize: 15, marginTop: 8 }}>Изменить фото</button>
+          </>
+        )}
+      </div>
+
+      {isGroup && (
+        <>
+          <div style={{ color: colors.gray, fontSize: 13, marginBottom: 4 }}>Название</div>
+          <input style={{ ...input, marginBottom: 14 }} value={title} onChange={(e) => setTitle(e.target.value)} maxLength={60} />
+        </>
+      )}
+
+      <div style={{ color: colors.gray, fontSize: 13, marginBottom: 4 }}>Описание</div>
+      <textarea
+        style={{ ...input, minHeight: 80, resize: "vertical", marginBottom: 14 }}
+        value={description}
+        onChange={(e) => setDescription(e.target.value)}
+        maxLength={500}
+        placeholder="Чем занимается чат"
+      />
+
+      {isGroup && (
+        <>
+          <div style={{ color: colors.gray, fontSize: 13, marginBottom: 4 }}>Кто может приглашать участников в чат</div>
+          {rightsSelect(inviteMode, setInviteMode)}
+          <div style={{ color: colors.gray, fontSize: 13, marginBottom: 4 }}>Кто может редактировать информацию чата</div>
+          {rightsSelect(editMode, setEditMode)}
+          {!isCreator && <p style={{ color: colors.gray, fontSize: 13, marginTop: -6 }}>Права может менять только создатель группы.</p>}
+        </>
+      )}
+
+      {err && <p style={{ color: "#b00020", fontSize: 13 }}>{err}</p>}
+      <button onClick={save} disabled={saving} style={button}>{saving ? "Сохранение..." : "Сохранить"}</button>
+    </div>
+  );
+}
+
 // Панель чата: фото, название, участники, уведомления, добавление людей и выход из группы
 function ChatInfoPanel({
   chat,
@@ -846,6 +978,9 @@ function ChatInfoPanel({
   const committee = COMMITTEE_ROLES.includes(viewer.role);
   const isGroup = chat.kind === "group";
   const canSetPhoto = isGroup || (committee && (chat.kind === "general" || chat.kind === "committee"));
+  const canEdit = canEditChat(chat, viewer);
+  const canInvite = isGroup && (chat.invite_mode !== "creator" || chat.created_by === viewer.id);
+  const [editing, setEditing] = useState(false);
 
   async function loadMembers() {
     const { status, data } = await request(`/api/chats/${chat.id}/members`);
@@ -901,10 +1036,30 @@ function ChatInfoPanel({
 
   const actionBtn: CSSProperties = { ...inlineButton, flex: 1, padding: "10px 6px", fontSize: 14 };
 
+  if (editing) {
+    return (
+      <ChatSettingsView
+        chat={chat}
+        viewer={viewer}
+        onBack={() => setEditing(false)}
+        onSaved={() => {
+          setEditing(false);
+          onChanged();
+        }}
+      />
+    );
+  }
+
   return (
     <div style={{ ...card, width: "min(460px, 100%)", maxHeight: "85vh", overflowY: "auto", position: "fixed", top: 60, left: "50%", transform: "translateX(-50%)", zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.3)", textAlign: "center" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <span />
+        {canEdit ? (
+          <button onClick={() => setEditing(true)} style={{ ...linkStyle, color: colors.navy }} aria-label="Настройки">
+            <GearIcon />
+          </button>
+        ) : (
+          <span />
+        )}
         <button onClick={onClose} style={{ ...linkStyle, fontSize: 22, color: colors.navy }} aria-label="Закрыть">×</button>
       </div>
 
@@ -912,6 +1067,7 @@ function ChatInfoPanel({
         <ChatAvatar photoId={chat.photo_id} title={chat.title} size={120} />
       </div>
       <div style={{ fontSize: 22, fontWeight: "bold", marginTop: 10 }}>{chat.title}</div>
+      {chat.description && <p style={{ marginTop: 8, whiteSpace: "pre-wrap", textAlign: "left" }}>{chat.description}</p>}
       <div style={{ color: colors.gray, marginTop: 4 }}>
         {members.length} {members.length === 1 ? "участник" : members.length < 5 ? "участника" : "участников"}
       </div>
@@ -940,7 +1096,7 @@ function ChatInfoPanel({
       {err && <p style={{ color: "#b00020", fontSize: 13 }}>{err}</p>}
 
       <div style={{ textAlign: "left", marginTop: 16 }}>
-        {isGroup && !adding && (
+        {canInvite && !adding && (
           <button onClick={startAdding} style={{ ...linkStyle, fontSize: 15, color: colors.blue, marginBottom: 8 }}>+ Добавить участников</button>
         )}
         {adding && (

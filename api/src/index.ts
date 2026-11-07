@@ -1183,7 +1183,7 @@ async function listChats(request: Request, env: Env): Promise<Response> {
     .run();
 
   const rows = await env.DB.prepare(
-    `SELECT c.id, c.kind, c.title, c.photo_id,
+    `SELECT c.id, c.kind, c.title, c.photo_id, c.description, c.invite_mode, c.edit_mode, c.created_by,
             (SELECT p.photo_id FROM chat_members x LEFT JOIN profiles p ON p.user_id = x.user_id
               WHERE x.chat_id = c.id AND x.user_id <> ? LIMIT 1) AS other_photo,
             (SELECT body FROM messages WHERE chat_id = c.id AND deleted = 0 ORDER BY id DESC LIMIT 1) AS last_body,
@@ -1203,6 +1203,10 @@ async function listChats(request: Request, env: Env): Promise<Response> {
       kind: string;
       title: string | null;
       photo_id: string | null;
+      description: string | null;
+      invite_mode: string;
+      edit_mode: string;
+      created_by: number | null;
       other_photo: string | null;
       last_body: string | null;
       last_kind: string | null;
@@ -1216,6 +1220,10 @@ async function listChats(request: Request, env: Env): Promise<Response> {
     kind: r.kind,
     title: r.kind === "personal" ? r.other_name ?? "Личный чат" : r.title ?? "",
     photo_id: r.kind === "personal" ? r.other_photo : r.photo_id,
+    description: r.description,
+    invite_mode: r.invite_mode,
+    edit_mode: r.edit_mode,
+    created_by: r.created_by,
     last_body: r.last_body,
     last_kind: r.last_kind,
     last_at: r.last_at,
@@ -1473,9 +1481,14 @@ async function listChatMembers(request: Request, env: Env, chatId: number): Prom
 async function addChatMembers(request: Request, env: Env, chatId: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const chat = await chatById(env, chatId);
+  const chat = await env.DB.prepare("SELECT id, kind, created_by, invite_mode FROM chats WHERE id = ?")
+    .bind(chatId)
+    .first<{ id: number; kind: string; created_by: number | null; invite_mode: string }>();
   if (!chat || chat.kind !== "group") return json({ error: "Добавлять можно только в группу" }, 400);
-  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  if (!(await canAccessChat(env, user, { id: chat.id, kind: chat.kind }))) return json({ error: "Нет доступа" }, 403);
+  if (chat.invite_mode === "creator" && chat.created_by !== user.id) {
+    return json({ error: "Приглашать участников может только создатель группы" }, 403);
+  }
   const body = await readJson(request);
   const ids = Array.isArray(body.user_ids) ? body.user_ids.map(Number).filter((n) => Number.isInteger(n) && n > 0) : [];
   for (const id of new Set(ids)) {
@@ -1494,6 +1507,40 @@ async function leaveChat(request: Request, env: Env, chatId: number): Promise<Re
   const chat = await chatById(env, chatId);
   if (!chat || chat.kind !== "group") return json({ error: "Из этого чата нельзя выйти" }, 400);
   await env.DB.prepare("DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?").bind(chatId, user.id).run();
+  return json({ ok: true });
+}
+
+// Настройки чата. В группе название и описание меняет тот, кому разрешено (создатель или все участники),
+// а права приглашения и редактирования задаёт только создатель. В общих чатах меняет комсостав.
+async function updateChatSettings(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await env.DB.prepare(
+    "SELECT id, kind, title, description, invite_mode, edit_mode, created_by FROM chats WHERE id = ?",
+  )
+    .bind(chatId)
+    .first<{ id: number; kind: string; title: string; description: string | null; invite_mode: string; edit_mode: string; created_by: number | null }>();
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (chat.kind === "personal") return json({ error: "У личного чата нет настроек" }, 400);
+
+  const isCreator = chat.created_by === user.id;
+  if (chat.kind === "group") {
+    if (!(await canAccessChat(env, user, { id: chat.id, kind: chat.kind }))) return json({ error: "Нет доступа" }, 403);
+    if (!(isCreator || chat.edit_mode === "all")) return json({ error: "Менять информацию может только создатель" }, 403);
+  } else if (!isCommittee(user)) {
+    return json({ error: "Менять настройки этого чата может только комсостав" }, 403);
+  }
+
+  const body = await readJson(request);
+  const title = chat.kind === "group" ? str(body.title, 60) || chat.title : chat.title;
+  const description = str(body.description, 500) || null;
+  // Права меняет только создатель группы
+  const inviteMode = chat.kind === "group" && isCreator && body.invite_mode === "creator" ? "creator" : isCreator && body.invite_mode === "all" ? "all" : chat.invite_mode;
+  const editMode = chat.kind === "group" && isCreator && body.edit_mode === "creator" ? "creator" : isCreator && body.edit_mode === "all" ? "all" : chat.edit_mode;
+
+  await env.DB.prepare("UPDATE chats SET title = ?, description = ?, invite_mode = ?, edit_mode = ? WHERE id = ?")
+    .bind(title, description, inviteMode, editMode, chatId)
+    .run();
   return json({ ok: true });
 }
 
@@ -1534,6 +1581,8 @@ export default {
       if (chatMembersMatch && method === "POST") return await addChatMembers(request, env, Number(chatMembersMatch[1]));
       const chatLeaveMatch = path.match(/^\/api\/chats\/(\d+)\/members\/me$/);
       if (chatLeaveMatch && method === "DELETE") return await leaveChat(request, env, Number(chatLeaveMatch[1]));
+      const chatSettingsMatch = path.match(/^\/api\/chats\/(\d+)\/settings$/);
+      if (chatSettingsMatch && method === "PUT") return await updateChatSettings(request, env, Number(chatSettingsMatch[1]));
       const chatPhotoMatch = path.match(/^\/api\/chats\/(\d+)\/photo$/);
       if (chatPhotoMatch && method === "PUT") return await setChatPhoto(request, env, Number(chatPhotoMatch[1]));
       const chatReadMatch = path.match(/^\/api\/chats\/(\d+)\/read$/);
