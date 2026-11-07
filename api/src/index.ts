@@ -1444,6 +1444,59 @@ async function setChatPhoto(request: Request, env: Env, chatId: number): Promise
   return json({ ok: true });
 }
 
+// Участники чата: в группах и личных — кто в чате, в общих чатах — все участники отряда (или комсостав)
+async function listChatMembers(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const base = `SELECT u.id, u.full_name, u.role, p.photo_id FROM users u LEFT JOIN profiles p ON p.user_id = u.id`;
+  let rows;
+  if (chat.kind === "general") {
+    rows = await env.DB.prepare(`${base} WHERE u.status = 'approved' ORDER BY u.full_name`).all();
+  } else if (chat.kind === "committee") {
+    rows = await env.DB.prepare(
+      `${base} WHERE u.status = 'approved' AND u.role IN ('master', 'commissar', 'commander') ORDER BY u.full_name`,
+    ).all();
+  } else {
+    rows = await env.DB.prepare(
+      `${base} JOIN chat_members m ON m.user_id = u.id WHERE m.chat_id = ? AND u.status = 'approved' ORDER BY u.full_name`,
+    )
+      .bind(chatId)
+      .all();
+  }
+  return json({ members: rows.results, viewer_id: user.id });
+}
+
+// Добавить людей в групповой чат: добавлять может любой участник группы
+async function addChatMembers(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat || chat.kind !== "group") return json({ error: "Добавлять можно только в группу" }, 400);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const body = await readJson(request);
+  const ids = Array.isArray(body.user_ids) ? body.user_ids.map(Number).filter((n) => Number.isInteger(n) && n > 0) : [];
+  for (const id of new Set(ids)) {
+    const ok = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'").bind(id).first();
+    if (ok) {
+      await env.DB.prepare("INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (?, ?)").bind(chatId, id).run();
+    }
+  }
+  return json({ ok: true });
+}
+
+// Выйти из группы (личные и общие чаты покинуть нельзя)
+async function leaveChat(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat || chat.kind !== "group") return json({ error: "Из этого чата нельзя выйти" }, 400);
+  await env.DB.prepare("DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?").bind(chatId, user.id).run();
+  return json({ ok: true });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -1476,6 +1529,11 @@ export default {
       const chatMessagesMatch = path.match(/^\/api\/chats\/(\d+)\/messages$/);
       if (chatMessagesMatch && method === "GET") return await listMessages(request, env, Number(chatMessagesMatch[1]), url);
       if (chatMessagesMatch && method === "POST") return await sendMessage(request, env, Number(chatMessagesMatch[1]));
+      const chatMembersMatch = path.match(/^\/api\/chats\/(\d+)\/members$/);
+      if (chatMembersMatch && method === "GET") return await listChatMembers(request, env, Number(chatMembersMatch[1]));
+      if (chatMembersMatch && method === "POST") return await addChatMembers(request, env, Number(chatMembersMatch[1]));
+      const chatLeaveMatch = path.match(/^\/api\/chats\/(\d+)\/members\/me$/);
+      if (chatLeaveMatch && method === "DELETE") return await leaveChat(request, env, Number(chatLeaveMatch[1]));
       const chatPhotoMatch = path.match(/^\/api\/chats\/(\d+)\/photo$/);
       if (chatPhotoMatch && method === "PUT") return await setChatPhoto(request, env, Number(chatPhotoMatch[1]));
       const chatReadMatch = path.match(/^\/api\/chats\/(\d+)\/read$/);

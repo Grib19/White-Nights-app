@@ -129,6 +129,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
   const [activeId, setActiveId] = useState<number | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [ably, setAbly] = useState<Ably.Realtime | null>(null);
@@ -188,6 +189,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
 
   function notify(msg: Msg) {
     if (!readSetting("chat-notify", false)) return;
+    if (readSetting(`chat-mute-${msg.chat_id}`, false)) return;
     if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
     const preview = readSetting("chat-notify-preview", true);
     try {
@@ -276,6 +278,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
             onBack={wide ? undefined : () => setActiveId(null)}
             onRead={loadChats}
             onChanged={loadChats}
+            onInfo={() => setShowInfo(true)}
           />
         </section>
       )}
@@ -288,6 +291,19 @@ export function ChatsPage({ viewer }: { viewer: User }) {
         <NewChatPanel viewerId={viewer.id} onCreated={chatCreated} onClose={() => setShowNew(false)} />
       )}
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showInfo && active && (
+        <ChatInfoPanel
+          chat={active}
+          viewer={viewer}
+          onClose={() => setShowInfo(false)}
+          onChanged={loadChats}
+          onLeft={() => {
+            setShowInfo(false);
+            setActiveId(null);
+            loadChats();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -299,6 +315,7 @@ function ChatView({
   onBack,
   onRead,
   onChanged,
+  onInfo,
 }: {
   chat: ChatItem;
   viewer: User;
@@ -306,6 +323,7 @@ function ChatView({
   onBack?: () => void;
   onRead: () => void;
   onChanged: () => void;
+  onInfo: () => void;
 }) {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -484,8 +502,14 @@ function ChatView({
             ← Назад
           </button>
         )}
-        <ChatAvatar photoId={chat.photo_id} title={chat.title} size={36} />
-        <b style={{ fontSize: 18, flex: 1 }}>{chat.title}</b>
+        <button
+          onClick={onInfo}
+          title="Информация о чате"
+          style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0, background: "none", border: "none", padding: 0, cursor: "pointer", color: colors.navy, textAlign: "left" }}
+        >
+          <ChatAvatar photoId={chat.photo_id} title={chat.title} size={36} />
+          <b style={{ fontSize: 18, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{chat.title}</b>
+        </button>
         {canSetPhoto && (
           <>
             <input
@@ -787,6 +811,168 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
       {note && <p style={{ color: "#b00020", fontSize: 13 }}>{note}</p>}
       <p style={{ color: colors.gray, fontSize: 13 }}>Настройки действуют только на этом устройстве.</p>
       <button style={{ ...button, width: "auto", padding: "8px 16px" }} onClick={onClose}>Готово</button>
+    </div>
+  );
+}
+
+interface Member {
+  id: number;
+  full_name: string;
+  role: string;
+  photo_id: string | null;
+}
+
+// Панель чата: фото, название, участники, уведомления, добавление людей и выход из группы
+function ChatInfoPanel({
+  chat,
+  viewer,
+  onClose,
+  onChanged,
+  onLeft,
+}: {
+  chat: ChatItem;
+  viewer: User;
+  onClose: () => void;
+  onChanged: () => void;
+  onLeft: () => void;
+}) {
+  const [members, setMembers] = useState<Member[]>([]);
+  const [muted, setMuted] = useState(() => readSetting(`chat-mute-${chat.id}`, false));
+  const [adding, setAdding] = useState(false);
+  const [candidates, setCandidates] = useState<Member[]>([]);
+  const [picked, setPicked] = useState<number[]>([]);
+  const [err, setErr] = useState("");
+  const photoRef = useRef<HTMLInputElement>(null);
+  const committee = COMMITTEE_ROLES.includes(viewer.role);
+  const isGroup = chat.kind === "group";
+  const canSetPhoto = isGroup || (committee && (chat.kind === "general" || chat.kind === "committee"));
+
+  async function loadMembers() {
+    const { status, data } = await request(`/api/chats/${chat.id}/members`);
+    if (status === 200) setMembers(data.members);
+    else setErr(data.error ?? "Не удалось загрузить участников");
+  }
+
+  useEffect(() => {
+    loadMembers();
+  }, [chat.id]);
+
+  function toggleMute() {
+    const next = !muted;
+    writeSetting(`chat-mute-${chat.id}`, next);
+    setMuted(next);
+  }
+
+  async function startAdding() {
+    setErr("");
+    const { status, data } = await request("/api/profiles");
+    if (status !== 200) return setErr("Не удалось загрузить участников отряда");
+    const inChat = new Set(members.map((m) => m.id));
+    setCandidates((data.users as Member[]).filter((u) => !inChat.has(u.id)));
+    setPicked([]);
+    setAdding(true);
+  }
+
+  async function addPicked() {
+    if (picked.length === 0) return;
+    const { status, data } = await request(`/api/chats/${chat.id}/members`, "POST", { user_ids: picked });
+    if (status === 200) {
+      setAdding(false);
+      loadMembers();
+      onChanged();
+    } else setErr(data.error ?? "Не удалось добавить");
+  }
+
+  async function leave() {
+    if (!window.confirm("Выйти из группы?")) return;
+    const { status, data } = await request(`/api/chats/${chat.id}/members/me`, "DELETE");
+    if (status === 200) onLeft();
+    else setErr(data.error ?? "Не удалось выйти");
+  }
+
+  async function setPhoto(file: File) {
+    setErr("");
+    const up = await uploadFile(file);
+    if (!up.ok || !up.id) return setErr(up.error ?? "Не удалось загрузить фото");
+    const { status, data } = await request(`/api/chats/${chat.id}/photo`, "PUT", { photo_id: up.id });
+    if (status === 200) onChanged();
+    else setErr(data.error ?? "Не удалось сменить фото");
+  }
+
+  const actionBtn: CSSProperties = { ...inlineButton, flex: 1, padding: "10px 6px", fontSize: 14 };
+
+  return (
+    <div style={{ ...card, width: "min(460px, 100%)", maxHeight: "85vh", overflowY: "auto", position: "fixed", top: 60, left: "50%", transform: "translateX(-50%)", zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.3)", textAlign: "center" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span />
+        <button onClick={onClose} style={{ ...linkStyle, fontSize: 22, color: colors.navy }} aria-label="Закрыть">×</button>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "center" }}>
+        <ChatAvatar photoId={chat.photo_id} title={chat.title} size={120} />
+      </div>
+      <div style={{ fontSize: 22, fontWeight: "bold", marginTop: 10 }}>{chat.title}</div>
+      <div style={{ color: colors.gray, marginTop: 4 }}>
+        {members.length} {members.length === 1 ? "участник" : members.length < 5 ? "участника" : "участников"}
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+        <button onClick={toggleMute} style={actionBtn}>{muted ? "Уведомления выключены" : "Уведомления включены"}</button>
+        {canSetPhoto && (
+          <>
+            <input
+              ref={photoRef}
+              type="file"
+              accept="image/*"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) setPhoto(f);
+                if (photoRef.current) photoRef.current.value = "";
+              }}
+            />
+            <button onClick={() => photoRef.current?.click()} style={actionBtn}>Фото чата</button>
+          </>
+        )}
+        {isGroup && <button onClick={leave} style={actionBtn}>Выйти</button>}
+      </div>
+
+      {err && <p style={{ color: "#b00020", fontSize: 13 }}>{err}</p>}
+
+      <div style={{ textAlign: "left", marginTop: 16 }}>
+        {isGroup && !adding && (
+          <button onClick={startAdding} style={{ ...linkStyle, fontSize: 15, color: colors.blue, marginBottom: 8 }}>+ Добавить участников</button>
+        )}
+        {adding && (
+          <div style={{ background: colors.field, borderRadius: 10, padding: 10, marginBottom: 10 }}>
+            {candidates.length === 0 && <p style={{ color: colors.gray, margin: 0 }}>Все участники отряда уже в группе.</p>}
+            {candidates.map((u) => (
+              <label key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
+                <input
+                  type="checkbox"
+                  checked={picked.includes(u.id)}
+                  onChange={(e) => setPicked((p) => (e.target.checked ? [...p, u.id] : p.filter((x) => x !== u.id)))}
+                />
+                {u.full_name}
+              </label>
+            ))}
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button onClick={addPicked} style={inlineButton}>Добавить</button>
+              <button onClick={() => setAdding(false)} style={inlineButton}>Отмена</button>
+            </div>
+          </div>
+        )}
+
+        {members.map((m) => (
+          <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: `1px solid ${colors.field}` }}>
+            <ChatAvatar photoId={m.photo_id} title={m.full_name} size={36} />
+            <span style={{ fontWeight: m.id === viewer.id ? "bold" : "normal" }}>
+              {m.full_name}
+              {m.id === viewer.id ? " (вы)" : ""}
+            </span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
