@@ -326,7 +326,8 @@ function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDel
         }}
       />
       <div style={{ marginTop: 8, display: "flex", gap: 14, alignItems: "center" }}>
-        <button type="button" onClick={() => setShowComments((v) => !v)} style={linkButton}>
+        <button type="button" onClick={() => setShowComments((v) => !v)} style={{ ...linkButton, display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <TabIcon name="comment" color="currentColor" />
           {showComments ? "Скрыть комментарии" : `Комментарии${post.comments_count ? ` (${post.comments_count})` : ""}`}
         </button>
         {canDelete && (

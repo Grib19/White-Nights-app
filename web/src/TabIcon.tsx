@@ -16,6 +16,15 @@ const paths: Record<string, ReactElement> = {
       <path d="M5 6.5h14a1.5 1.5 0 0 1 1.5 1.5v7a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 3v-3H5A1.5 1.5 0 0 1 3.5 15V8A1.5 1.5 0 0 1 5 6.5z" />
     </>
   ),
+  // Комментарии: облачко с тремя точками
+  comment: (
+    <>
+      <path d="M4.5 6.5h15a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5h-9.5l-4.5 3v-3h-1A1.5 1.5 0 0 1 3 16V8a1.5 1.5 0 0 1 1.5-1.5z" />
+      <circle cx="8" cy="12" r="0.9" fill="currentColor" />
+      <circle cx="12" cy="12" r="0.9" fill="currentColor" />
+      <circle cx="16" cy="12" r="0.9" fill="currentColor" />
+    </>
+  ),
   // Лента: лист с текстом
   feed: (
     <>
