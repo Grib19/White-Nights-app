@@ -759,7 +759,7 @@ function ChatView({
   }
 
   return (
-    <div style={{ ...card, display: "flex", flexDirection: "column", padding: 12 }}>
+    <div style={{ ...card, background: "#0b1420", display: "flex", flexDirection: "column", padding: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
         {onBack && (
           <button onClick={onBack} style={{ background: "none", border: "none", color: colors.blue, textDecoration: "underline", cursor: "pointer", padding: 0, fontSize: 16 }}>
@@ -769,7 +769,7 @@ function ChatView({
         <button
           onClick={onInfo}
           title="Информация о чате"
-          style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0, background: "none", border: "none", padding: 0, cursor: "pointer", color: colors.navy, textAlign: "left" }}
+          style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0, background: "none", border: "none", padding: 0, cursor: "pointer", color: "#f5f5f5", textAlign: "left" }}
         >
           <ChatAvatar photoId={chat.photo_id} title={chat.title} size={36} />
           <b style={{ fontSize: 18, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{chat.title}</b>
@@ -793,10 +793,10 @@ function ChatView({
       </div>
 
       {pinned && (
-        <div style={{ display: "flex", alignItems: "center", gap: 8, background: colors.field, borderRadius: 8, padding: "6px 10px", marginBottom: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, background: "#17212b", borderRadius: 8, padding: "6px 10px", marginBottom: 6 }}>
           <button
             onClick={() => scrollToMessage(pinned.id)}
-            style={{ flex: 1, minWidth: 0, background: "none", border: "none", textAlign: "left", cursor: "pointer", color: colors.navy, padding: 0 }}
+            style={{ flex: 1, minWidth: 0, background: "none", border: "none", textAlign: "left", cursor: "pointer", color: "#f5f5f5", padding: 0 }}
           >
             <div style={{ fontSize: 12, color: colors.blue, fontWeight: "bold" }}>📌 Закреплено · {pinned.author_name}</div>
             <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -950,7 +950,7 @@ function ChatView({
 
       {forwarding && <ForwardDialog chats={chatList} count={forwarding.length} onPick={forwardTo} onClose={() => setForwarding(null)} />}
 
-      {err && <div style={{ color: "#b00020", fontSize: 13, marginTop: 4 }}>{err}</div>}
+      {err && <div style={{ color: "#ff8a8a", fontSize: 13, marginTop: 4 }}>{err}</div>}
 
       {selectMode ? (
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 8, background: colors.navy, borderRadius: 24, padding: "10px 16px", color: "#fff" }}>
