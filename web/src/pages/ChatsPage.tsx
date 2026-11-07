@@ -1,13 +1,12 @@
 // Чаты в стиле Telegram: слева список диалогов, справа сам чат.
 // Новые сообщения приходят через Ably, без перезагрузки страницы.
-import { CSSProperties, FormEvent, useEffect, useRef, useState } from "react";
+import { CSSProperties, FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import * as Ably from "ably";
 import { COMMITTEE_ROLES, User, downloadAttachment, loadAttachmentUrl, loadImage, request, uploadAttachment, uploadFile } from "../api";
 import { button, card, colors, input } from "../styles";
 
 // Кнопки в строках и шапке не растягиваются на всю ширину
 const inlineButton: CSSProperties = { ...button, width: "auto", whiteSpace: "nowrap" };
-import { ReactionBar } from "./FeedPage";
 import { TabIcon } from "../TabIcon";
 
 interface ChatItem {
@@ -312,6 +311,116 @@ export function ChatsPage({ viewer }: { viewer: User }) {
   );
 }
 
+// Реакции под сообщением: только счётчики, добавлять и убирать их можно через меню сообщения
+const QUICK_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🔥", "👏", "🙏"];
+
+function ReactionChips({ reactions, onPick }: { reactions: Reaction[]; onPick: (emoji: string) => void }) {
+  if (reactions.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 2 }}>
+      {reactions.map((r) => (
+        <button
+          key={r.emoji}
+          title={r.users.join(", ")}
+          onClick={() => onPick(r.emoji)}
+          style={{
+            border: "none",
+            borderRadius: 12,
+            padding: "2px 8px",
+            fontSize: 13,
+            cursor: "pointer",
+            color: colors.navy,
+            background: r.mine ? colors.yellow : colors.field,
+          }}
+        >
+          {r.emoji} {r.count}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Меню сообщения по правому клику: реакции сверху, затем действия
+function MessageMenu({
+  x,
+  y,
+  canCopy,
+  canEdit,
+  canDelete,
+  onReact,
+  onCopy,
+  onEdit,
+  onDelete,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  canCopy: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
+  onReact: (emoji: string) => void;
+  onCopy: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onClose: () => void;
+}) {
+  const left = Math.max(8, Math.min(x, window.innerWidth - 268));
+  const top = Math.max(8, Math.min(y, window.innerHeight - 260));
+  const item: CSSProperties = {
+    display: "block",
+    width: "100%",
+    textAlign: "left",
+    background: "none",
+    border: "none",
+    padding: "10px 16px",
+    fontSize: 15,
+    cursor: "pointer",
+    color: colors.navy,
+  };
+  return (
+    <div
+      onClick={onClose}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onClose();
+      }}
+      style={{ position: "fixed", inset: 0, zIndex: 40 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ position: "fixed", left, top, width: 260, background: "#fff", borderRadius: 14, boxShadow: "0 6px 24px rgba(0,0,0,0.25)", overflow: "hidden", padding: "6px 0" }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 10px 8px" }}>
+          {QUICK_EMOJI.map((emoji) => (
+            <button key={emoji} onClick={() => onReact(emoji)} style={{ background: "none", border: "none", fontSize: 18, cursor: "pointer", padding: 2 }}>
+              {emoji}
+            </button>
+          ))}
+        </div>
+        <div style={{ borderTop: `1px solid ${colors.field}` }}>
+          {canCopy && <button onClick={onCopy} style={item}>Копировать текст</button>}
+          {canEdit && <button onClick={onEdit} style={item}>Изменить</button>}
+          {canDelete && <button onClick={onDelete} style={{ ...item, color: "#b00020" }}>Удалить</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Отдельное окно поверх чата, как в Telegram
+function Modal({ children, onClose }: { children: ReactNode; onClose: () => void }) {
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+    >
+      <div onClick={(e) => e.stopPropagation()} style={{ ...card, width: "min(420px, 100%)", boxShadow: "0 8px 24px rgba(0,0,0,0.3)" }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 function ChatView({
   chat,
   viewer,
@@ -333,6 +442,9 @@ function ChatView({
   const [hasMore, setHasMore] = useState(false);
   const [text, setText] = useState("");
   const [editing, setEditing] = useState<Msg | null>(null);
+  const [editText, setEditText] = useState("");
+  const [deleting, setDeleting] = useState<Msg | null>(null);
+  const [menu, setMenu] = useState<{ msg: Msg; x: number; y: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
@@ -384,6 +496,8 @@ function ChatView({
   useEffect(() => {
     setMessages([]);
     setEditing(null);
+    setDeleting(null);
+    setMenu(null);
     setText("");
     loadLatest();
   }, [chat.id]);
@@ -430,23 +544,11 @@ function ChatView({
     setBusy(true);
     setErr("");
     try {
-      if (editing) {
-        const { status, data } = await request(`/api/messages/${editing.id}`, "PUT", { body });
-        if (status === 200) {
-          const edited = editing;
-          setMessages((prev) =>
-            prev.map((x) => (x.id === edited.id ? { ...x, body, edited_at: new Date().toISOString() } : x)),
-          );
-          setEditing(null);
-          setText("");
-        } else setErr(data.error ?? "Не удалось сохранить");
-      } else {
-        const { status, data } = await request(`/api/chats/${chat.id}/messages`, "POST", { body });
-        if (status === 201) {
-          merge([data.message]);
-          setText("");
-        } else setErr(data.error ?? "Не удалось отправить");
-      }
+      const { status, data } = await request(`/api/chats/${chat.id}/messages`, "POST", { body });
+      if (status === 201) {
+        merge([data.message]);
+        setText("");
+      } else setErr(data.error ?? "Не удалось отправить");
     } catch {
       setErr("Нет связи с сервером");
     } finally {
@@ -485,17 +587,37 @@ function ChatView({
     }
   }
 
-  async function remove(m: Msg) {
-    if (!window.confirm("Удалить сообщение?")) return;
-    const { status, data } = await request(`/api/messages/${m.id}`, "DELETE");
+  async function confirmDelete() {
+    if (!deleting) return;
+    const id = deleting.id;
+    setDeleting(null);
+    const { status, data } = await request(`/api/messages/${id}`, "DELETE");
+    if (status === 200) setMessages((prev) => prev.filter((x) => x.id !== id));
+    else setErr(data.error ?? "Не удалось удалить");
+  }
+
+  async function saveEdit() {
+    if (!editing) return;
+    const body = editText.trim();
+    if (!body) return;
+    const id = editing.id;
+    const { status, data } = await request(`/api/messages/${id}`, "PUT", { body });
     if (status === 200) {
-      setMessages((prev) => prev.filter((x) => x.id !== m.id));
-    } else setErr(data.error ?? "Не удалось удалить");
+      setMessages((prev) => prev.map((x) => (x.id === id ? { ...x, body, edited_at: new Date().toISOString() } : x)));
+      setEditing(null);
+    } else setErr(data.error ?? "Не удалось сохранить");
   }
 
   function startEdit(m: Msg) {
+    setMenu(null);
     setEditing(m);
-    setText(m.body);
+    setEditText(m.body);
+  }
+
+  async function react(m: Msg, emoji: string) {
+    setMenu(null);
+    await request("/api/reactions", "POST", { target_type: "message", target_id: m.id, emoji });
+    loadLatest();
   }
 
   return (
@@ -545,11 +667,17 @@ function ChatView({
           return (
             <div key={m.id} style={{ alignSelf: own ? "flex-end" : "flex-start", maxWidth: "80%" }}>
               <div
+                onContextMenu={(e) => {
+                  if (m.deleted) return;
+                  e.preventDefault();
+                  setMenu({ msg: m, x: e.clientX, y: e.clientY });
+                }}
                 style={{
                   background: own ? colors.yellow : colors.field,
                   color: colors.navy,
                   borderRadius: 12,
                   padding: "6px 10px",
+                  userSelect: menu ? "none" : undefined,
                 }}
               >
                 {!own && <div style={{ fontSize: 12, fontWeight: "bold", color: colors.blue }}>{m.author_name}</div>}
@@ -574,37 +702,60 @@ function ChatView({
                   {m.edited_at ? " · изменено" : ""}
                 </div>
               </div>
-              {!m.deleted && (
-                <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 2, justifyContent: own ? "flex-end" : "flex-start" }}>
-                  {canEdit && (
-                    <button onClick={() => startEdit(m)} style={linkStyle}>Изменить</button>
-                  )}
-                  {canDelete && (
-                    <button onClick={() => remove(m)} style={linkStyle}>Удалить</button>
-                  )}
-                </div>
-              )}
-              {!m.deleted && (
-                <ReactionBar
-                  reactions={m.reactions}
-                  onPick={async (emoji) => {
-                    await request("/api/reactions", "POST", { target_type: "message", target_id: m.id, emoji });
-                    loadLatest();
-                  }}
-                />
-              )}
+              {!m.deleted && <ReactionChips reactions={m.reactions} onPick={(emoji) => react(m, emoji)} />}
             </div>
           );
         })}
         <div ref={bottomRef} />
       </div>
 
-      {editing && (
-        <div style={{ fontSize: 13, color: colors.blue, marginTop: 6 }}>
-          Редактирование сообщения ·{" "}
-          <button onClick={() => { setEditing(null); setText(""); }} style={linkStyle}>Отмена</button>
-        </div>
+      {menu && (
+        <MessageMenu
+          x={menu.x}
+          y={menu.y}
+          canCopy={!!menu.msg.body}
+          canEdit={menu.msg.author_id === viewer.id && !menu.msg.attachment_id}
+          canDelete={menu.msg.author_id === viewer.id || moderated}
+          onReact={(emoji) => react(menu.msg, emoji)}
+          onCopy={() => {
+            navigator.clipboard?.writeText(menu.msg.body).catch(() => undefined);
+            setMenu(null);
+          }}
+          onEdit={() => startEdit(menu.msg)}
+          onDelete={() => {
+            setDeleting(menu.msg);
+            setMenu(null);
+          }}
+          onClose={() => setMenu(null)}
+        />
       )}
+
+      {editing && (
+        <Modal onClose={() => setEditing(null)}>
+          <div style={{ fontSize: 18, fontWeight: "bold", color: colors.navy }}>Изменить сообщение</div>
+          <textarea
+            style={{ ...input, minHeight: 100, resize: "vertical", marginTop: 10 }}
+            value={editText}
+            onChange={(e) => setEditText(e.target.value)}
+            autoFocus
+          />
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 12 }}>
+            <button onClick={() => setEditing(null)} style={inlineButton}>Отмена</button>
+            <button onClick={saveEdit} disabled={!editText.trim()} style={inlineButton}>Сохранить</button>
+          </div>
+        </Modal>
+      )}
+
+      {deleting && (
+        <Modal onClose={() => setDeleting(null)}>
+          <div style={{ fontSize: 16, color: colors.navy }}>Удалить сообщение? Его не будет видно никому, восстановить нельзя.</div>
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
+            <button onClick={() => setDeleting(null)} style={inlineButton}>Отмена</button>
+            <button onClick={confirmDelete} style={{ ...inlineButton, background: "#b00020", color: "#fff" }}>Удалить</button>
+          </div>
+        </Modal>
+      )}
+
       {err && <div style={{ color: "#b00020", fontSize: 13, marginTop: 4 }}>{err}</div>}
 
       <form
@@ -626,7 +777,7 @@ function ChatView({
         <button
           type="button"
           onClick={() => fileRef.current?.click()}
-          disabled={busy || !!editing}
+          disabled={busy}
           aria-label="Прикрепить файл"
           style={composerIconButton}
         >
@@ -656,8 +807,8 @@ function ChatView({
             maxHeight: 120,
           }}
         />
-        {text.trim() || editing ? (
-          <button type="submit" disabled={busy || !text.trim()} aria-label={editing ? "Сохранить" : "Отправить"} style={composerIconButton}>
+        {text.trim() ? (
+          <button type="submit" disabled={busy} aria-label="Отправить" style={composerIconButton}>
             <SendIcon />
           </button>
         ) : (
