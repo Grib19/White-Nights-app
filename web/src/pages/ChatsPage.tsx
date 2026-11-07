@@ -516,6 +516,7 @@ function ChatView({
   const [editText, setEditText] = useState("");
   const [deleting, setDeleting] = useState<number[] | null>(null);
   const [menu, setMenu] = useState<{ msg: Msg; x: number; y: number } | null>(null);
+  const [hoverId, setHoverId] = useState<number | null>(null);
   const [replyTo, setReplyTo] = useState<Msg | null>(null);
   const [pinned, setPinned] = useState<PinnedMsg | null>(null);
   const [selectMode, setSelectMode] = useState(false);
@@ -819,7 +820,13 @@ function ChatView({
           const own = m.author_id === viewer.id;
           const isSelected = selected.includes(m.id);
           return (
-            <div key={m.id} id={`msg-${m.id}`} style={{ alignSelf: own ? "flex-end" : "flex-start", maxWidth: "80%" }}>
+            <div
+              key={m.id}
+              id={`msg-${m.id}`}
+              onMouseEnter={() => setHoverId(m.id)}
+              onMouseLeave={() => setHoverId((cur) => (cur === m.id ? null : cur))}
+              style={{ alignSelf: own ? "flex-end" : "flex-start", maxWidth: "80%", position: "relative" }}
+            >
               <div
                 onClick={() => {
                   if (selectMode && !m.deleted) toggleSelect(m.id);
@@ -878,6 +885,38 @@ function ChatView({
                   {m.edited_at ? " · изменено" : ""}
                 </div>
               </div>
+              {hoverId === m.id && !m.deleted && !selectMode && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: -14,
+                    ...(own ? { right: 6 } : { left: 6 }),
+                    display: "flex",
+                    alignItems: "center",
+                    background: colors.navy,
+                    borderRadius: 16,
+                    padding: 2,
+                    boxShadow: "0 2px 8px rgba(0,0,0,0.35)",
+                    zIndex: 5,
+                  }}
+                >
+                  <button type="button" onClick={() => setReplyTo(m)} aria-label="Ответить" style={hoverButton}>
+                    <ReplyIcon />
+                  </button>
+                  <span style={{ width: 1, height: 18, background: "rgba(255,255,255,0.2)" }} />
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      const r = e.currentTarget.getBoundingClientRect();
+                      setMenu({ msg: m, x: r.left, y: r.bottom + 4 });
+                    }}
+                    aria-label="Действия"
+                    style={hoverButton}
+                  >
+                    <DotsIcon />
+                  </button>
+                </div>
+              )}
               {!m.deleted && <ReactionChips reactions={m.reactions} onPick={(emoji) => react(m, emoji)} />}
             </div>
           );
@@ -1032,6 +1071,35 @@ function ChatView({
         </>
       )}
     </div>
+  );
+}
+
+const hoverButton: CSSProperties = {
+  background: "none",
+  border: "none",
+  padding: "6px 8px",
+  cursor: "pointer",
+  color: "#f5f5f5",
+  display: "flex",
+  alignItems: "center",
+};
+
+function ReplyIcon() {
+  return (
+    <svg {...iconProps} width={18} height={18}>
+      <path d="M9 14L4 9l5-5" />
+      <path d="M4 9h10a6 6 0 0 1 6 6v3" />
+    </svg>
+  );
+}
+
+function DotsIcon() {
+  return (
+    <svg width={18} height={18} viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="6" cy="12" r="1.8" fill="currentColor" />
+      <circle cx="12" cy="12" r="1.8" fill="currentColor" />
+      <circle cx="18" cy="12" r="1.8" fill="currentColor" />
+    </svg>
   );
 }
 
