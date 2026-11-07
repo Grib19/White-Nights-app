@@ -41,6 +41,7 @@ interface Reaction {
   emoji: string;
   count: number;
   mine: boolean;
+  users: string[];
 }
 
 interface Comment {
@@ -326,9 +327,15 @@ function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDel
         }}
       />
       <div style={{ marginTop: 8, display: "flex", gap: 14, alignItems: "center" }}>
-        <button type="button" onClick={() => setShowComments((v) => !v)} style={{ ...linkButton, display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <button
+          type="button"
+          onClick={() => setShowComments((v) => !v)}
+          title={showComments ? "Скрыть комментарии" : "Комментарии"}
+          aria-label={showComments ? "Скрыть комментарии" : "Комментарии"}
+          style={{ ...linkButton, display: "inline-flex", alignItems: "center", gap: 6 }}
+        >
           <TabIcon name="comment" color="currentColor" />
-          {showComments ? "Скрыть комментарии" : `Комментарии${post.comments_count ? ` (${post.comments_count})` : ""}`}
+          {post.comments_count > 0 && <span>{post.comments_count}</span>}
         </button>
         {canDelete && (
           <button
@@ -345,32 +352,77 @@ function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDel
 }
 
 // Полоска эмодзи под постом или комментарием: число реакций и подсветка своей
+// Подсказка «кто поставил» показывается, если держать курсор на реакции 2 секунды
+const HOVER_DELAY_MS = 2000;
+
 function ReactionBar({ reactions, onPick }: { reactions: Reaction[]; onPick: (emoji: string) => void | Promise<void> }) {
   const byEmoji = new Map(reactions.map((r) => [r.emoji, r]));
+  const [tip, setTip] = useState<string | null>(null);
+  const [timer, setTimer] = useState<number | null>(null);
+
+  function startHover(emoji: string) {
+    if (timer) window.clearTimeout(timer);
+    const id = window.setTimeout(() => setTip(emoji), HOVER_DELAY_MS);
+    setTimer(id);
+  }
+  function stopHover() {
+    if (timer) window.clearTimeout(timer);
+    setTimer(null);
+    setTip(null);
+  }
+
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
       {REACTION_EMOJIS.map((emoji) => {
         const r = byEmoji.get(emoji);
         const mine = !!r?.mine;
+        const showTip = tip === emoji && !!r && r.count > 0;
         return (
-          <button
-            key={emoji}
-            type="button"
-            onClick={() => onPick(emoji)}
-            className="nav-tab"
-            style={{
-              padding: "2px 10px",
-              borderRadius: 999,
-              border: mine ? `2px solid ${colors.navy}` : `1px solid ${colors.field}`,
-              background: mine ? colors.yellow : colors.field,
-              color: colors.navy,
-              cursor: "pointer",
-              fontSize: 15,
-            }}
-          >
-            {emoji}
-            {r && r.count > 0 ? ` ${r.count}` : ""}
-          </button>
+          <span key={emoji} style={{ position: "relative", display: "inline-block" }}>
+            <button
+              type="button"
+              onClick={() => onPick(emoji)}
+              onMouseEnter={() => startHover(emoji)}
+              onMouseLeave={stopHover}
+              className="nav-tab"
+              style={{
+                padding: "2px 10px",
+                borderRadius: 999,
+                border: mine ? `2px solid ${colors.navy}` : `1px solid ${colors.field}`,
+                background: mine ? colors.yellow : colors.field,
+                color: colors.navy,
+                cursor: "pointer",
+                fontSize: 15,
+              }}
+            >
+              {emoji}
+              {r && r.count > 0 ? ` ${r.count}` : ""}
+            </button>
+            {showTip && (
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: "calc(100% + 6px)",
+                  left: 0,
+                  zIndex: 10,
+                  minWidth: 160,
+                  maxWidth: 260,
+                  padding: "8px 10px",
+                  borderRadius: 8,
+                  background: colors.navy,
+                  color: colors.white,
+                  fontSize: 13,
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.25)",
+                  pointerEvents: "none",
+                }}
+              >
+                <div style={{ fontWeight: "bold", marginBottom: 4 }}>{emoji} поставили:</div>
+                {r!.users.map((name) => (
+                  <div key={name}>{name}</div>
+                ))}
+              </div>
+            )}
+          </span>
         );
       })}
     </div>

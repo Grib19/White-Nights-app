@@ -863,6 +863,7 @@ interface ReactionSummary {
   emoji: string;
   count: number;
   mine: boolean;
+  users: string[];
 }
 
 // Реакции для набора постов или комментариев: сколько каждого эмодзи и поставил ли их сам участник
@@ -887,8 +888,23 @@ async function loadReactions(
   ).results;
   for (const r of rows) {
     const list = result.get(r.target_id) ?? [];
-    list.push({ emoji: r.emoji, count: r.count, mine: r.mine > 0 });
+    list.push({ emoji: r.emoji, count: r.count, mine: r.mine > 0, users: [] });
     result.set(r.target_id, list);
+  }
+  // Имена тех, кто поставил реакцию (для подсказки при наведении)
+  const who = (
+    await env.DB.prepare(
+      `SELECT r.target_id, r.emoji, u.full_name
+         FROM reactions r JOIN users u ON u.id = r.user_id
+        WHERE r.target_type = ? AND r.target_id IN (${marks})
+        ORDER BY u.full_name`,
+    )
+      .bind(type, ...ids)
+      .all<{ target_id: number; emoji: string; full_name: string }>()
+  ).results;
+  for (const w of who) {
+    const item = result.get(w.target_id)?.find((x) => x.emoji === w.emoji);
+    if (item) item.users.push(w.full_name);
   }
   return result;
 }
