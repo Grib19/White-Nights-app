@@ -1111,6 +1111,10 @@ interface MessageRow {
   created_at: string;
   edited_at: string | null;
   deleted: number;
+  reply_to_id: number | null;
+  reply_author: string | null;
+  reply_body: string | null;
+  forwarded_from: string | null;
 }
 
 async function chatById(env: Env, id: number): Promise<ChatRow | null> {
@@ -1314,11 +1318,16 @@ function publicMessage(r: MessageRow): Record<string, unknown> {
     created_at: r.created_at,
     edited_at: r.edited_at,
     deleted,
+    reply_to: r.reply_to_id ? { id: r.reply_to_id, author_name: r.reply_author ?? "", body: r.reply_body ?? "" } : null,
+    forwarded_from: r.forwarded_from ?? null,
   };
 }
 
 const MESSAGE_SELECT = `SELECT m.id, m.chat_id, m.author_id, u.full_name AS author_name, m.body,
-       m.attachment_id, m.attachment_name, m.attachment_kind, m.created_at, m.edited_at, m.deleted
+       m.attachment_id, m.attachment_name, m.attachment_kind, m.created_at, m.edited_at, m.deleted,
+       m.reply_to_id, m.forwarded_from,
+       (SELECT u2.full_name FROM messages x JOIN users u2 ON u2.id = x.author_id WHERE x.id = m.reply_to_id) AS reply_author,
+       (SELECT CASE WHEN x.deleted = 0 THEN x.body ELSE '' END FROM messages x WHERE x.id = m.reply_to_id) AS reply_body
   FROM messages m JOIN users u ON u.id = m.author_id`;
 
 async function listMessages(request: Request, env: Env, chatId: number, url: URL): Promise<Response> {
@@ -1352,8 +1361,17 @@ async function listMessages(request: Request, env: Env, chatId: number, url: URL
     rows.map((r) => r.id),
     user.id,
   );
+  const pinned = await env.DB.prepare(
+    `SELECT m.id, m.body, m.attachment_kind, u.full_name AS author_name FROM chats c
+       JOIN messages m ON m.id = c.pinned_message_id AND m.deleted = 0
+       JOIN users u ON u.id = m.author_id
+      WHERE c.id = ?`,
+  )
+    .bind(chatId)
+    .first<{ id: number; body: string; attachment_kind: string | null; author_name: string }>();
   return json({
     messages: rows.map((r) => ({ ...publicMessage(r), reactions: reactions.get(r.id) ?? [] })),
+    pinned: pinned ?? null,
     viewer_id: user.id,
     viewer_committee: isCommittee(user),
   });
@@ -1373,12 +1391,19 @@ async function sendMessage(request: Request, env: Env, chatId: number): Promise<
   const attachmentKind = body.attachment_kind === "image" ? "image" : attachmentId ? "file" : null;
   if (attachmentId && !/^[A-Za-z0-9_-]{10,64}$/.test(attachmentId)) return json({ error: "Неверный файл" }, 400);
   if (!text && !attachmentId) return json({ error: "Напишите сообщение или прикрепите файл" }, 400);
+  const replyId = Number(body.reply_to_id) || 0;
+  if (replyId > 0) {
+    const target = await env.DB.prepare("SELECT id FROM messages WHERE id = ? AND chat_id = ? AND deleted = 0")
+      .bind(replyId, chatId)
+      .first();
+    if (!target) return json({ error: "Сообщение, на которое вы отвечаете, не найдено" }, 400);
+  }
 
   const res = await env.DB.prepare(
-    `INSERT INTO messages (chat_id, author_id, body, attachment_id, attachment_name, attachment_kind)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (chat_id, author_id, body, attachment_id, attachment_name, attachment_kind, reply_to_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(chatId, user.id, text, attachmentId || null, attachmentName, attachmentKind)
+    .bind(chatId, user.id, text, attachmentId || null, attachmentName, attachmentKind, replyId > 0 ? replyId : null)
     .run();
   const row = await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`)
     .bind(Number(res.meta.last_row_id))
@@ -1424,9 +1449,75 @@ async function deleteMessage(request: Request, env: Env, id: number): Promise<Re
     .first<{ attachment_id: string | null }>();
   await env.DB.prepare("DELETE FROM reactions WHERE target_type = 'message' AND target_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM messages WHERE id = ?").bind(id).run();
-  if (attachment?.attachment_id) await env.FILES.delete(`att:${attachment.attachment_id}`);
+  await env.DB.prepare("UPDATE chats SET pinned_message_id = NULL WHERE pinned_message_id = ?").bind(id).run();
+  // Файл удаляем, только если его не осталось в пересланных копиях
+  if (attachment?.attachment_id) {
+    const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM messages WHERE attachment_id = ?")
+      .bind(attachment.attachment_id)
+      .first<{ n: number }>();
+    if (!left || left.n === 0) await env.FILES.delete(`att:${attachment.attachment_id}`);
+  }
   await ablyPublish(env, row.chat_id, "delete", { id, chat_id: row.chat_id });
   return json({ ok: true });
+}
+
+// Закрепить или открепить сообщение. В группе — кому разрешено менять информацию, в общих чатах — комсоставу
+async function pinMessage(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const msg = await env.DB.prepare("SELECT chat_id, deleted FROM messages WHERE id = ?")
+    .bind(id)
+    .first<{ chat_id: number; deleted: number }>();
+  if (!msg || msg.deleted) return json({ error: "Сообщение не найдено" }, 404);
+  const chat = await env.DB.prepare("SELECT id, kind, created_by, edit_mode FROM chats WHERE id = ?")
+    .bind(msg.chat_id)
+    .first<{ id: number; kind: string; created_by: number | null; edit_mode: string }>();
+  if (!chat || !(await canAccessChat(env, user, { id: chat.id, kind: chat.kind }))) return json({ error: "Нет доступа" }, 403);
+  if (chat.kind === "group" && !(chat.created_by === user.id || chat.edit_mode === "all")) {
+    return json({ error: "Закреплять сообщения может только создатель группы" }, 403);
+  }
+  if ((chat.kind === "general" || chat.kind === "committee") && !isCommittee(user)) {
+    return json({ error: "Закреплять сообщения в этом чате может только комсостав" }, 403);
+  }
+  const body = await readJson(request);
+  const pin = body.pinned !== false;
+  await env.DB.prepare("UPDATE chats SET pinned_message_id = ? WHERE id = ?").bind(pin ? id : null, chat.id).run();
+  await ablyPublish(env, chat.id, "pin", { chat_id: chat.id });
+  return json({ ok: true });
+}
+
+// Переслать сообщение в другой чат. Вложение не копируется, а ссылается на тот же файл.
+async function forwardMessage(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const src = await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.id = ? AND m.deleted = 0`).bind(id).first<MessageRow>();
+  if (!src) return json({ error: "Сообщение не найдено" }, 404);
+  const srcChat = await chatById(env, src.chat_id);
+  if (!srcChat || !(await canAccessChat(env, user, srcChat))) return json({ error: "Нет доступа" }, 403);
+  const body = await readJson(request);
+  const targetId = Number(body.chat_id);
+  const target = Number.isInteger(targetId) && targetId > 0 ? await chatById(env, targetId) : null;
+  if (!target) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, target))) return json({ error: "Нет доступа" }, 403);
+  const res = await env.DB.prepare(
+    `INSERT INTO messages (chat_id, author_id, body, attachment_id, attachment_name, attachment_kind, forwarded_from)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      target.id,
+      user.id,
+      src.body,
+      src.attachment_id,
+      src.attachment_name,
+      src.attachment_kind,
+      src.forwarded_from ?? src.author_name,
+    )
+    .run();
+  const row = await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`)
+    .bind(Number(res.meta.last_row_id))
+    .first<MessageRow>();
+  if (row) await ablyPublish(env, target.id, "message", { ...publicMessage(row), reactions: [] });
+  return json({ ok: true, chat_id: target.id }, 201);
 }
 
 async function markRead(request: Request, env: Env, chatId: number): Promise<Response> {
@@ -1601,6 +1692,10 @@ export default {
       const messageMatch = path.match(/^\/api\/messages\/(\d+)$/);
       if (messageMatch && method === "PUT") return await editMessage(request, env, Number(messageMatch[1]));
       if (messageMatch && method === "DELETE") return await deleteMessage(request, env, Number(messageMatch[1]));
+      const messagePinMatch = path.match(/^\/api\/messages\/(\d+)\/pin$/);
+      if (messagePinMatch && method === "PUT") return await pinMessage(request, env, Number(messagePinMatch[1]));
+      const messageForwardMatch = path.match(/^\/api\/messages\/(\d+)\/forward$/);
+      if (messageForwardMatch && method === "POST") return await forwardMessage(request, env, Number(messageForwardMatch[1]));
 
       if (method === "GET" && path === "/api/info") return await listInfo(request, env);
       const infoMatch = path.match(/^\/api\/info\/([a-z0-9-]{1,40})$/);

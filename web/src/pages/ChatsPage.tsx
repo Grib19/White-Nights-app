@@ -44,6 +44,8 @@ interface Msg {
   edited_at: string | null;
   deleted: boolean;
   reactions: Reaction[];
+  reply_to: { id: number; author_name: string; body: string } | null;
+  forwarded_from: string | null;
 }
 
 const PAGE = 50;
@@ -311,6 +313,19 @@ export function ChatsPage({ viewer }: { viewer: User }) {
   );
 }
 
+interface PinnedMsg {
+  id: number;
+  body: string;
+  author_name: string;
+  attachment_kind: string | null;
+}
+
+// Закреплять сообщения: в группе — кому разрешено менять информацию, в общих чатах — комсоставу, в личных — любому участнику
+function canPinChat(chat: ChatItem, viewer: User): boolean {
+  if (chat.kind === "personal" || chat.kind === "favorites") return true;
+  return canEditChat(chat, viewer);
+}
+
 // Реакции под сообщением: только счётчики, добавлять и убирать их можно через меню сообщения
 const QUICK_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🔥", "👏", "🙏"];
 
@@ -344,28 +359,40 @@ function ReactionChips({ reactions, onPick }: { reactions: Reaction[]; onPick: (
 function MessageMenu({
   x,
   y,
+  canPin,
+  pinned,
   canCopy,
   canEdit,
   canDelete,
   onReact,
+  onReply,
+  onPin,
   onCopy,
   onEdit,
+  onForward,
+  onSelect,
   onDelete,
   onClose,
 }: {
   x: number;
   y: number;
+  canPin: boolean;
+  pinned: boolean;
   canCopy: boolean;
   canEdit: boolean;
   canDelete: boolean;
   onReact: (emoji: string) => void;
+  onReply: () => void;
+  onPin: () => void;
   onCopy: () => void;
   onEdit: () => void;
+  onForward: () => void;
+  onSelect: () => void;
   onDelete: () => void;
   onClose: () => void;
 }) {
   const left = Math.max(8, Math.min(x, window.innerWidth - 268));
-  const top = Math.max(8, Math.min(y, window.innerHeight - 260));
+  const top = Math.max(8, Math.min(y, window.innerHeight - 440));
   const item: CSSProperties = {
     display: "block",
     width: "100%",
@@ -398,12 +425,56 @@ function MessageMenu({
           ))}
         </div>
         <div style={{ borderTop: `1px solid ${colors.field}` }}>
+          <button onClick={onReply} style={item}>Ответить</button>
+          {canPin && <button onClick={onPin} style={item}>{pinned ? "Открепить" : "Закрепить"}</button>}
           {canCopy && <button onClick={onCopy} style={item}>Копировать текст</button>}
           {canEdit && <button onClick={onEdit} style={item}>Изменить</button>}
+          <button onClick={onForward} style={item}>Переслать</button>
+          <button onClick={onSelect} style={item}>Выделить</button>
           {canDelete && <button onClick={onDelete} style={{ ...item, color: "#b00020" }}>Удалить</button>}
         </div>
       </div>
     </div>
+  );
+}
+
+// Выбор чата для пересылки
+function ForwardDialog({
+  chats,
+  count,
+  onPick,
+  onClose,
+}: {
+  chats: ChatItem[];
+  count: number;
+  onPick: (chatId: number) => void;
+  onClose: () => void;
+}) {
+  const [q, setQ] = useState("");
+  const shown = chats.filter((c) => c.title.toLowerCase().includes(q.trim().toLowerCase()));
+  return (
+    <Modal onClose={onClose}>
+      <div style={{ fontSize: 18, fontWeight: "bold", color: colors.navy, marginBottom: 10 }}>
+        Переслать{count > 1 ? ` (${count})` : ""}
+      </div>
+      <input style={{ ...input, marginBottom: 8 }} placeholder="Поиск чата" value={q} onChange={(e) => setQ(e.target.value)} />
+      <div style={{ maxHeight: 320, overflowY: "auto" }}>
+        {shown.map((c) => (
+          <button
+            key={c.id}
+            onClick={() => onPick(c.id)}
+            style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", background: "none", border: "none", padding: "8px 4px", cursor: "pointer", textAlign: "left", color: colors.navy }}
+          >
+            <ChatAvatar photoId={c.photo_id} title={c.title} size={36} />
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.title}</span>
+          </button>
+        ))}
+        {shown.length === 0 && <p style={{ color: colors.gray }}>Чаты не найдены</p>}
+      </div>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+        <button onClick={onClose} style={inlineButton}>Отмена</button>
+      </div>
+    </Modal>
   );
 }
 
@@ -443,8 +514,14 @@ function ChatView({
   const [text, setText] = useState("");
   const [editing, setEditing] = useState<Msg | null>(null);
   const [editText, setEditText] = useState("");
-  const [deleting, setDeleting] = useState<Msg | null>(null);
+  const [deleting, setDeleting] = useState<number[] | null>(null);
   const [menu, setMenu] = useState<{ msg: Msg; x: number; y: number } | null>(null);
+  const [replyTo, setReplyTo] = useState<Msg | null>(null);
+  const [pinned, setPinned] = useState<PinnedMsg | null>(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<number[]>([]);
+  const [forwarding, setForwarding] = useState<number[] | null>(null);
+  const [chatList, setChatList] = useState<ChatItem[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
@@ -453,6 +530,7 @@ function ChatView({
   const moderated = committee && (chat.kind === "general" || chat.kind === "committee");
   // Фото меняет любой участник группы, а фото общих чатов — только комсостав
   const canSetPhoto = chat.kind === "group" || (committee && (chat.kind === "general" || chat.kind === "committee"));
+  const canPin = canPinChat(chat, viewer);
   const photoRef = useRef<HTMLInputElement>(null);
 
   async function setPhoto(file: File) {
@@ -479,6 +557,7 @@ function ChatView({
     const { status, data } = await request(`/api/chats/${chat.id}/messages`);
     if (status === 200) {
       merge(data.messages);
+      setPinned(data.pinned ?? null);
       setHasMore(data.messages.length >= PAGE);
     } else setErr(data.error ?? "Не удалось загрузить сообщения");
   }
@@ -498,11 +577,16 @@ function ChatView({
     setEditing(null);
     setDeleting(null);
     setMenu(null);
+    setReplyTo(null);
+    setPinned(null);
+    setSelectMode(false);
+    setSelected([]);
+    setForwarding(null);
     setText("");
     loadLatest();
   }, [chat.id]);
 
-  // Подписка на события этого чата: новые сообщения, правки, удаления и реакции
+  // Подписка на события этого чата: сообщения, правки, удаления, реакции и закрепление
   useEffect(() => {
     if (!ably) return;
     const channel = ably.channels.get(`chat:${chat.id}`);
@@ -514,17 +598,20 @@ function ChatView({
     const onDelete = (m: Ably.Message) => {
       const d = parseEvent<{ id: number }>(m.data);
       setMessages((prev) => prev.filter((x) => x.id !== d.id));
+      loadLatest();
     };
-    const onReact = () => loadLatest();
+    const onRefresh = () => loadLatest();
     channel.subscribe("message", onMessage);
     channel.subscribe("edit", onEdit);
     channel.subscribe("delete", onDelete);
-    channel.subscribe("react", onReact);
+    channel.subscribe("react", onRefresh);
+    channel.subscribe("pin", onRefresh);
     return () => {
       channel.unsubscribe("message", onMessage);
       channel.unsubscribe("edit", onEdit);
       channel.unsubscribe("delete", onDelete);
-      channel.unsubscribe("react", onReact);
+      channel.unsubscribe("react", onRefresh);
+      channel.unsubscribe("pin", onRefresh);
     };
   }, [ably, chat.id]);
 
@@ -544,10 +631,11 @@ function ChatView({
     setBusy(true);
     setErr("");
     try {
-      const { status, data } = await request(`/api/chats/${chat.id}/messages`, "POST", { body });
+      const { status, data } = await request(`/api/chats/${chat.id}/messages`, "POST", { body, reply_to_id: replyTo?.id ?? null });
       if (status === 201) {
         merge([data.message]);
         setText("");
+        setReplyTo(null);
       } else setErr(data.error ?? "Не удалось отправить");
     } catch {
       setErr("Нет связи с сервером");
@@ -574,10 +662,12 @@ function ChatView({
         attachment_id: up.id,
         attachment_name: file.name,
         attachment_kind: file.type.startsWith("image/") ? "image" : "file",
+        reply_to_id: replyTo?.id ?? null,
       });
       if (status === 201) {
         merge([data.message]);
         setText("");
+        setReplyTo(null);
       } else setErr(data.error ?? "Не удалось отправить");
     } catch {
       setErr("Нет связи с сервером");
@@ -588,12 +678,17 @@ function ChatView({
   }
 
   async function confirmDelete() {
-    if (!deleting) return;
-    const id = deleting.id;
+    const ids = deleting ?? [];
     setDeleting(null);
-    const { status, data } = await request(`/api/messages/${id}`, "DELETE");
-    if (status === 200) setMessages((prev) => prev.filter((x) => x.id !== id));
-    else setErr(data.error ?? "Не удалось удалить");
+    for (const id of ids) {
+      const { status, data } = await request(`/api/messages/${id}`, "DELETE");
+      if (status === 200) setMessages((prev) => prev.filter((x) => x.id !== id));
+      else {
+        setErr(data.error ?? "Не удалось удалить");
+        break;
+      }
+    }
+    endSelect();
   }
 
   async function saveEdit() {
@@ -618,6 +713,49 @@ function ChatView({
     setMenu(null);
     await request("/api/reactions", "POST", { target_type: "message", target_id: m.id, emoji });
     loadLatest();
+  }
+
+  async function setPinState(id: number, pin: boolean) {
+    const { status, data } = await request(`/api/messages/${id}/pin`, "PUT", { pinned: pin });
+    if (status === 200) loadLatest();
+    else setErr(data.error ?? "Не удалось закрепить");
+  }
+
+  function openForward(ids: number[]) {
+    setMenu(null);
+    setForwarding(ids);
+    request("/api/chats")
+      .then(({ status, data }) => {
+        if (status === 200) setChatList(data.chats);
+      })
+      .catch(() => undefined);
+  }
+
+  async function forwardTo(chatId: number) {
+    const ids = forwarding ?? [];
+    setForwarding(null);
+    for (const id of ids) await request(`/api/messages/${id}/forward`, "POST", { chat_id: chatId });
+    endSelect();
+    if (chatId === chat.id) loadLatest();
+  }
+
+  function startSelect(m: Msg) {
+    setMenu(null);
+    setSelectMode(true);
+    setSelected([m.id]);
+  }
+
+  function toggleSelect(id: number) {
+    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  function endSelect() {
+    setSelectMode(false);
+    setSelected([]);
+  }
+
+  function scrollToMessage(id: number) {
+    document.getElementById(`msg-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
   return (
@@ -654,7 +792,24 @@ function ChatView({
         )}
       </div>
 
-      <div style={{ height: "calc(100vh - 300px)", minHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, padding: "4px 2px" }}>
+      {pinned && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, background: colors.field, borderRadius: 8, padding: "6px 10px", marginBottom: 6 }}>
+          <button
+            onClick={() => scrollToMessage(pinned.id)}
+            style={{ flex: 1, minWidth: 0, background: "none", border: "none", textAlign: "left", cursor: "pointer", color: colors.navy, padding: 0 }}
+          >
+            <div style={{ fontSize: 12, color: colors.blue, fontWeight: "bold" }}>📌 Закреплено · {pinned.author_name}</div>
+            <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {pinned.body || (pinned.attachment_kind === "image" ? "Фото" : "Файл")}
+            </div>
+          </button>
+          {canPin && (
+            <button onClick={() => setPinState(pinned.id, false)} aria-label="Открепить" style={linkStyle}>✕</button>
+          )}
+        </div>
+      )}
+
+      <div style={{ height: "calc(100vh - 320px)", minHeight: 300, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, padding: "4px 2px" }}>
         {hasMore && (
           <button onClick={loadOlder} style={{ alignSelf: "center", ...inlineButton, padding: "4px 12px", fontSize: 13 }}>
             Загрузить раньше
@@ -662,11 +817,13 @@ function ChatView({
         )}
         {messages.map((m) => {
           const own = m.author_id === viewer.id;
-          const canEdit = own && !m.deleted && !m.attachment_id;
-          const canDelete = !m.deleted && (own || moderated);
+          const isSelected = selected.includes(m.id);
           return (
-            <div key={m.id} style={{ alignSelf: own ? "flex-end" : "flex-start", maxWidth: "80%" }}>
+            <div key={m.id} id={`msg-${m.id}`} style={{ alignSelf: own ? "flex-end" : "flex-start", maxWidth: "80%" }}>
               <div
+                onClick={() => {
+                  if (selectMode && !m.deleted) toggleSelect(m.id);
+                }}
                 onContextMenu={(e) => {
                   if (m.deleted) return;
                   e.preventDefault();
@@ -677,10 +834,26 @@ function ChatView({
                   color: colors.navy,
                   borderRadius: 12,
                   padding: "6px 10px",
-                  userSelect: menu ? "none" : undefined,
+                  cursor: selectMode && !m.deleted ? "pointer" : undefined,
+                  outline: isSelected ? `2px solid ${colors.blue}` : undefined,
                 }}
               >
+                {m.forwarded_from && !m.deleted && (
+                  <div style={{ fontSize: 12, fontStyle: "italic", color: colors.gray }}>Переслано от {m.forwarded_from}</div>
+                )}
                 {!own && <div style={{ fontSize: 12, fontWeight: "bold", color: colors.blue }}>{m.author_name}</div>}
+                {m.reply_to && !m.deleted && (
+                  <div
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      scrollToMessage(m.reply_to!.id);
+                    }}
+                    style={{ borderLeft: `3px solid ${colors.blue}`, paddingLeft: 6, margin: "2px 0 4px", background: "rgba(0,0,0,0.05)", borderRadius: 4, cursor: "pointer" }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: "bold", color: colors.blue }}>{m.reply_to.author_name}</div>
+                    <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.reply_to.body || "Вложение"}</div>
+                  </div>
+                )}
                 {m.deleted ? (
                   <div style={{ fontStyle: "italic", color: colors.gray }}>Сообщение удалено</div>
                 ) : (
@@ -688,7 +861,10 @@ function ChatView({
                     {m.attachment_id && m.attachment_kind === "image" && <AttachmentImage id={m.attachment_id} name={m.attachment_name ?? "фото"} />}
                     {m.attachment_id && m.attachment_kind !== "image" && (
                       <button
-                        onClick={() => downloadAttachment(m.attachment_id!, m.attachment_name ?? "file")}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          downloadAttachment(m.attachment_id!, m.attachment_name ?? "file");
+                        }}
                         style={{ background: "none", border: "none", color: colors.blue, textDecoration: "underline", cursor: "pointer", padding: 0, fontSize: 14 }}
                       >
                         📎 {m.attachment_name ?? "Файл"}
@@ -713,17 +889,31 @@ function ChatView({
         <MessageMenu
           x={menu.x}
           y={menu.y}
+          canPin={canPin}
+          pinned={pinned?.id === menu.msg.id}
           canCopy={!!menu.msg.body}
           canEdit={menu.msg.author_id === viewer.id && !menu.msg.attachment_id}
           canDelete={menu.msg.author_id === viewer.id || moderated}
           onReact={(emoji) => react(menu.msg, emoji)}
+          onReply={() => {
+            setMenu(null);
+            setReplyTo(menu.msg);
+          }}
+          onPin={() => {
+            const id = menu.msg.id;
+            const pin = pinned?.id !== id;
+            setMenu(null);
+            setPinState(id, pin);
+          }}
           onCopy={() => {
             navigator.clipboard?.writeText(menu.msg.body).catch(() => undefined);
             setMenu(null);
           }}
           onEdit={() => startEdit(menu.msg)}
+          onForward={() => openForward([menu.msg.id])}
+          onSelect={() => startSelect(menu.msg)}
           onDelete={() => {
-            setDeleting(menu.msg);
+            setDeleting([menu.msg.id]);
             setMenu(null);
           }}
           onClose={() => setMenu(null)}
@@ -748,7 +938,9 @@ function ChatView({
 
       {deleting && (
         <Modal onClose={() => setDeleting(null)}>
-          <div style={{ fontSize: 16, color: colors.navy }}>Удалить сообщение? Его не будет видно никому, восстановить нельзя.</div>
+          <div style={{ fontSize: 16, color: colors.navy }}>
+            {deleting.length === 1 ? "Удалить сообщение?" : `Удалить сообщения (${deleting.length})?`} Восстановить нельзя.
+          </div>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
             <button onClick={() => setDeleting(null)} style={inlineButton}>Отмена</button>
             <button onClick={confirmDelete} style={{ ...inlineButton, background: "#b00020", color: "#fff" }}>Удалить</button>
@@ -756,72 +948,89 @@ function ChatView({
         </Modal>
       )}
 
+      {forwarding && <ForwardDialog chats={chatList} count={forwarding.length} onPick={forwardTo} onClose={() => setForwarding(null)} />}
+
       {err && <div style={{ color: "#b00020", fontSize: 13, marginTop: 4 }}>{err}</div>}
 
-      <form
-        onSubmit={(e: FormEvent) => {
-          e.preventDefault();
-          sendText();
-        }}
-        style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8, background: colors.navy, borderRadius: 24, padding: "4px 8px 4px 6px" }}
-      >
-        <input
-          ref={fileRef}
-          type="file"
-          hidden
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) attach(f);
-          }}
-        />
-        <button
-          type="button"
-          onClick={() => fileRef.current?.click()}
-          disabled={busy}
-          aria-label="Прикрепить файл"
-          style={composerIconButton}
-        >
-          <ClipIcon />
-        </button>
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+      {selectMode ? (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 8, background: colors.navy, borderRadius: 24, padding: "10px 16px", color: "#fff" }}>
+          <button onClick={endSelect} style={{ ...linkStyle, color: "#fff" }}>Отмена</button>
+          <span>Выбрано: {selected.length}</span>
+          <div style={{ display: "flex", gap: 14 }}>
+            <button onClick={() => openForward(selected)} disabled={selected.length === 0} style={{ ...linkStyle, color: "#fff" }}>Переслать</button>
+            <button onClick={() => setDeleting(selected)} disabled={selected.length === 0} style={{ ...linkStyle, color: "#ff8a8a" }}>Удалить</button>
+          </div>
+        </div>
+      ) : (
+        <>
+          {replyTo && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: colors.blue, marginTop: 6 }}>
+              <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                Ответ на сообщение {replyTo.author_name}: {replyTo.body || "вложение"}
+              </span>
+              <button onClick={() => setReplyTo(null)} aria-label="Отменить ответ" style={linkStyle}>✕</button>
+            </div>
+          )}
+          <form
+            onSubmit={(e: FormEvent) => {
               e.preventDefault();
               sendText();
-            }
-          }}
-          rows={1}
-          placeholder="Сообщение..."
-          style={{
-            flex: 1,
-            resize: "none",
-            background: "transparent",
-            border: "none",
-            outline: "none",
-            color: "#f5f5f5",
-            fontSize: 16,
-            fontFamily: "inherit",
-            padding: "8px 4px",
-            maxHeight: 120,
-          }}
-        />
-        {text.trim() ? (
-          <button type="submit" disabled={busy} aria-label="Отправить" style={composerIconButton}>
-            <SendIcon />
-          </button>
-        ) : (
-          <>
-            <button type="button" disabled aria-label="Смайлики" style={composerIconButton}>
-              <SmileIcon />
+            }}
+            style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8, background: colors.navy, borderRadius: 24, padding: "4px 8px 4px 6px" }}
+          >
+            <input
+              ref={fileRef}
+              type="file"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) attach(f);
+              }}
+            />
+            <button type="button" onClick={() => fileRef.current?.click()} disabled={busy} aria-label="Прикрепить файл" style={composerIconButton}>
+              <ClipIcon />
             </button>
-            <button type="button" disabled aria-label="Голосовое сообщение" style={composerIconButton}>
-              <MicIcon />
-            </button>
-          </>
-        )}
-      </form>
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  sendText();
+                }
+              }}
+              rows={1}
+              placeholder="Сообщение..."
+              style={{
+                flex: 1,
+                resize: "none",
+                background: "transparent",
+                border: "none",
+                outline: "none",
+                color: "#f5f5f5",
+                fontSize: 16,
+                fontFamily: "inherit",
+                padding: "8px 4px",
+                maxHeight: 120,
+              }}
+            />
+            {text.trim() ? (
+              <button type="submit" disabled={busy} aria-label="Отправить" style={composerIconButton}>
+                <SendIcon />
+              </button>
+            ) : (
+              <>
+                <button type="button" disabled aria-label="Смайлики" style={composerIconButton}>
+                  <SmileIcon />
+                </button>
+                <button type="button" disabled aria-label="Голосовое сообщение" style={composerIconButton}>
+                  <MicIcon />
+                </button>
+              </>
+            )}
+          </form>
+        </>
+      )}
     </div>
   );
 }
