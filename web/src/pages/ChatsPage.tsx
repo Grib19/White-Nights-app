@@ -771,7 +771,7 @@ function NewChatPanel({
   onClose: () => void;
 }) {
   const [users, setUsers] = useState<{ id: number; full_name: string }[]>([]);
-  const [mode, setMode] = useState<"personal" | "group">("personal");
+  const [mode, setMode] = useState<"personal" | "group">("group");
   const [personalId, setPersonalId] = useState<number | null>(null);
   const [title, setTitle] = useState("");
   const [picked, setPicked] = useState<number[]>([]);
@@ -805,7 +805,6 @@ function NewChatPanel({
   return (
     <div style={{ ...card, width: "min(420px, 100%)", position: "fixed", top: 80, left: "50%", transform: "translateX(-50%)", zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.3)" }}>
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <button style={{ ...inlineButton, opacity: mode === "personal" ? 1 : 0.6 }} onClick={() => setMode("personal")}>Личный чат</button>
         <button style={{ ...inlineButton, opacity: mode === "group" ? 1 : 0.6 }} onClick={() => setMode("group")}>Группа</button>
       </div>
 
