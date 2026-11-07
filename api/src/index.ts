@@ -6,6 +6,9 @@ export interface Env {
   FILES: KVNamespace;
   // Полный ключ Ably (appId.keyId:secret), задаётся командой wrangler secret put ABLY_API_KEY
   ABLY_API_KEY?: string;
+  // Ключи для push-уведомлений: публичный и приватный (wrangler secret put)
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
 }
 
 type Role = "candidate" | "fighter" | "master" | "commissar" | "commander";
@@ -1411,6 +1414,11 @@ async function sendMessage(request: Request, env: Env, chatId: number): Promise<
   if (!row) return json({ error: "Не удалось сохранить" }, 500);
   const message = { ...publicMessage(row), reactions: [] };
   await ablyPublish(env, chatId, "message", message);
+  try {
+    await notifyChatMembers(request, env, chat, user.id);
+  } catch (e) {
+    console.error("Push", e);
+  }
   return json({ message }, 201);
 }
 
@@ -1612,6 +1620,115 @@ async function leaveChat(request: Request, env: Env, chatId: number): Promise<Re
   return json({ ok: true });
 }
 
+// ---- Push-уведомления (Web Push с ключами VAPID). Текст сообщения в push не передаётся. ----
+const PUSH_MAX_SENDS = 45; // Workers разрешает ограниченное число подзапросов на один запрос
+
+function b64urlToBytes(s: string): Uint8Array {
+  const b = atob(s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "="));
+  return Uint8Array.from(b, (c) => c.charCodeAt(0));
+}
+
+function bytesToB64url(bytes: Uint8Array): string {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Заголовок Authorization для push-сервиса браузера (JWT, подписанный ключом VAPID)
+async function vapidAuthorization(env: Env, endpoint: string, origin: string): Promise<string | null> {
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return null;
+  const pub = b64urlToBytes(env.VAPID_PUBLIC_KEY);
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    {
+      kty: "EC",
+      crv: "P-256",
+      d: env.VAPID_PRIVATE_KEY,
+      x: bytesToB64url(pub.slice(1, 33)),
+      y: bytesToB64url(pub.slice(33, 65)),
+      ext: true,
+    },
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+  const enc = new TextEncoder();
+  const head = bytesToB64url(enc.encode(JSON.stringify({ typ: "JWT", alg: "ES256" })));
+  const body = bytesToB64url(
+    enc.encode(JSON.stringify({ aud: new URL(endpoint).origin, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: origin })),
+  );
+  const sig = new Uint8Array(
+    await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, enc.encode(`${head}.${body}`)),
+  );
+  return `vapid t=${head}.${body}.${bytesToB64url(sig)}, k=${env.VAPID_PUBLIC_KEY}`;
+}
+
+async function sendPush(env: Env, sub: { id: number; endpoint: string }, origin: string): Promise<void> {
+  const auth = await vapidAuthorization(env, sub.endpoint, origin);
+  if (!auth) return;
+  const res = await fetch(sub.endpoint, {
+    method: "POST",
+    headers: { TTL: "86400", Urgency: "normal", Authorization: auth, "Content-Length": "0" },
+  });
+  // Подписка устарела (браузер её отозвал) — удаляем
+  if (res.status === 404 || res.status === 410) {
+    await env.DB.prepare("DELETE FROM push_subscriptions WHERE id = ?").bind(sub.id).run();
+  }
+}
+
+// Уведомляем участников чата, кроме автора. Тех, кому чат недоступен, не трогаем.
+async function notifyChatMembers(request: Request, env: Env, chat: ChatRow, authorId: number): Promise<void> {
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return;
+  const cols = "SELECT s.id, s.endpoint FROM push_subscriptions s JOIN users u ON u.id = s.user_id";
+  let stmt;
+  if (chat.kind === "general") {
+    stmt = env.DB.prepare(`${cols} WHERE u.status = 'approved' AND s.user_id <> ? LIMIT ?`).bind(authorId, PUSH_MAX_SENDS);
+  } else if (chat.kind === "committee") {
+    stmt = env.DB.prepare(
+      `${cols} WHERE u.status = 'approved' AND u.role IN (${COMMITTEE.map(() => "?").join(",")}) AND s.user_id <> ? LIMIT ?`,
+    ).bind(...COMMITTEE, authorId, PUSH_MAX_SENDS);
+  } else {
+    stmt = env.DB.prepare(
+      `${cols} JOIN chat_members m ON m.user_id = s.user_id WHERE m.chat_id = ? AND s.user_id <> ? LIMIT ?`,
+    ).bind(chat.id, authorId, PUSH_MAX_SENDS);
+  }
+  const rows = (await stmt.all<{ id: number; endpoint: string }>()).results;
+  const origin = new URL(request.url).origin;
+  await Promise.allSettled(rows.map((r) => sendPush(env, r, origin)));
+}
+
+async function pushKey(env: Env): Promise<Response> {
+  return json({ key: env.VAPID_PUBLIC_KEY ?? null });
+}
+
+async function savePushSubscription(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const endpoint = str(body.endpoint, 2000);
+  const keys = (body.keys ?? {}) as Record<string, unknown>;
+  const p256dh = str(keys.p256dh, 200);
+  const auth = str(keys.auth, 200);
+  if (!endpoint.startsWith("https://") || !p256dh || !auth) return json({ error: "Неверная подписка" }, 400);
+  await env.DB.prepare(
+    `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)
+     ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth`,
+  )
+    .bind(user.id, endpoint, p256dh, auth)
+    .run();
+  return json({ ok: true }, 201);
+}
+
+async function removePushSubscription(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  await env.DB.prepare("DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?")
+    .bind(str(body.endpoint, 2000), user.id)
+    .run();
+  return json({ ok: true });
+}
+
 // Настройки чата. В группе название и описание меняет тот, кому разрешено (создатель или все участники),
 // а права приглашения и редактирования задаёт только создатель. В общих чатах меняет комсостав.
 async function updateChatSettings(request: Request, env: Env, chatId: number): Promise<Response> {
@@ -1683,6 +1800,9 @@ export default {
       if (chatMembersMatch && method === "POST") return await addChatMembers(request, env, Number(chatMembersMatch[1]));
       const chatLeaveMatch = path.match(/^\/api\/chats\/(\d+)\/members\/me$/);
       if (chatLeaveMatch && method === "DELETE") return await leaveChat(request, env, Number(chatLeaveMatch[1]));
+      if (method === "GET" && path === "/api/push/key") return await pushKey(env);
+      if (method === "POST" && path === "/api/push/subscribe") return await savePushSubscription(request, env);
+      if (method === "DELETE" && path === "/api/push/subscribe") return await removePushSubscription(request, env);
       const chatSettingsMatch = path.match(/^\/api\/chats\/(\d+)\/settings$/);
       if (chatSettingsMatch && method === "PUT") return await updateChatSettings(request, env, Number(chatSettingsMatch[1]));
       const chatPhotoMatch = path.match(/^\/api\/chats\/(\d+)\/photo$/);

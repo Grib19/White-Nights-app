@@ -1,6 +1,7 @@
 // Чаты в стиле Telegram: слева список диалогов, справа сам чат.
 // Новые сообщения приходят через Ably, без перезагрузки страницы.
 import { CSSProperties, FormEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { enablePush, disablePush } from "../push";
 import * as Ably from "ably";
 import { COMMITTEE_ROLES, User, downloadAttachment, loadAttachmentUrl, loadImage, request, uploadAttachment, uploadFile } from "../api";
 import { button, card, colors, input } from "../styles";
@@ -1309,12 +1310,14 @@ function SettingsPanel({ onClose }: { onClose: () => void }) {
 
   async function toggleNotify(on: boolean) {
     setNote("");
-    if (on && typeof Notification !== "undefined" && Notification.permission !== "granted") {
-      const result = await Notification.requestPermission();
-      if (result !== "granted") {
-        setNote("Браузер не разрешил уведомления. Разрешите их в настройках сайта.");
+    if (on) {
+      const error = await enablePush();
+      if (error) {
+        setNote(error);
         return;
       }
+    } else {
+      await disablePush().catch(() => {});
     }
     writeSetting("chat-notify", on);
     setNotify(on);
