@@ -612,7 +612,7 @@ function ChatView({
           e.preventDefault();
           sendText();
         }}
-        style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8, background: "#17212b", borderRadius: 24, padding: "4px 8px 4px 6px" }}
+        style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8, background: colors.navy, borderRadius: 24, padding: "4px 8px 4px 6px" }}
       >
         <input
           ref={fileRef}
