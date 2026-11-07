@@ -4,6 +4,8 @@
 export interface Env {
   DB: D1Database;
   FILES: KVNamespace;
+  // Полный ключ Ably (appId.keyId:secret), задаётся командой wrangler secret put ABLY_API_KEY
+  ABLY_API_KEY?: string;
 }
 
 type Role = "candidate" | "fighter" | "master" | "commissar" | "commander";
@@ -869,7 +871,7 @@ interface ReactionSummary {
 // Реакции для набора постов или комментариев: сколько каждого эмодзи и поставил ли их сам участник
 async function loadReactions(
   env: Env,
-  type: "post" | "comment",
+  type: "post" | "comment" | "message",
   ids: number[],
   userId: number,
 ): Promise<Map<number, ReactionSummary[]>> {
@@ -914,15 +916,24 @@ async function toggleReaction(request: Request, env: Env): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
   const body = await readJson(request);
-  const type = body.target_type === "post" ? "post" : body.target_type === "comment" ? "comment" : null;
+  const type =
+    body.target_type === "post" ? "post" : body.target_type === "comment" ? "comment" : body.target_type === "message" ? "message" : null;
   const id = Number(body.target_id);
   const emoji = typeof body.emoji === "string" ? body.emoji : "";
   if (!type || !Number.isInteger(id) || id <= 0) return json({ error: "Неверный объект" }, 400);
   if (!EMOJIS.includes(emoji)) return json({ error: "Такой реакции нет" }, 400);
 
-  const table = type === "post" ? "posts" : "comments";
-  const exists = await env.DB.prepare(`SELECT id FROM ${table} WHERE id = ?`).bind(id).first();
+  const table = type === "post" ? "posts" : type === "comment" ? "comments" : "messages";
+  const exists = await env.DB.prepare(`SELECT id, chat_id FROM ${table} WHERE id = ?`)
+    .bind(id)
+    .first<{ id: number; chat_id?: number }>();
   if (!exists) return json({ error: "Не найдено" }, 404);
+  let chatIdForEvent: number | null = null;
+  if (type === "message") {
+    const chat = await chatById(env, exists.chat_id ?? 0);
+    if (!chat || !(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+    chatIdForEvent = chat.id;
+  }
 
   const current = await env.DB.prepare(
     "SELECT emoji FROM reactions WHERE target_type = ? AND target_id = ? AND user_id = ?",
@@ -941,6 +952,7 @@ async function toggleReaction(request: Request, env: Env): Promise<Response> {
       .bind(type, id, user.id, emoji)
       .run();
   }
+  if (chatIdForEvent !== null) await ablyPublish(env, chatIdForEvent, "react", { id, chat_id: chatIdForEvent });
   return json({ ok: true });
 }
 
@@ -1076,6 +1088,334 @@ async function deleteSong(request: Request, env: Env, id: string): Promise<Respo
 
 // ---------- маршрутизация ----------
 
+// ---------- чаты ----------
+// Сообщения хранятся в D1, а доставляются в реальном времени через Ably.
+// Браузер получает токен только с правом подписки на чаты, которые ему доступны.
+
+interface ChatRow {
+  id: number;
+  kind: string;
+}
+
+interface MessageRow {
+  id: number;
+  chat_id: number;
+  author_id: number;
+  author_name: string;
+  body: string;
+  attachment_id: string | null;
+  attachment_name: string | null;
+  attachment_kind: string | null;
+  created_at: string;
+  edited_at: string | null;
+  deleted: number;
+}
+
+async function chatById(env: Env, id: number): Promise<ChatRow | null> {
+  return await env.DB.prepare("SELECT id, kind FROM chats WHERE id = ?").bind(id).first<ChatRow>();
+}
+
+async function canAccessChat(env: Env, user: UserRow, chat: ChatRow): Promise<boolean> {
+  if (chat.kind === "general") return true;
+  if (chat.kind === "committee") return isCommittee(user);
+  const member = await env.DB.prepare("SELECT 1 AS ok FROM chat_members WHERE chat_id = ? AND user_id = ?")
+    .bind(chat.id, user.id)
+    .first();
+  return !!member;
+}
+
+async function accessibleChatIds(env: Env, user: UserRow): Promise<number[]> {
+  const rows = await env.DB.prepare(
+    `SELECT c.id FROM chats c LEFT JOIN chat_members m ON m.chat_id = c.id AND m.user_id = ?
+      WHERE c.kind = 'general' OR (c.kind = 'committee' AND ? = 1) OR m.user_id IS NOT NULL`,
+  )
+    .bind(user.id, isCommittee(user) ? 1 : 0)
+    .all<{ id: number }>();
+  return rows.results.map((r) => r.id);
+}
+
+// Отправка события в канал чата. Ошибка доставки не ломает сохранение сообщения.
+async function ablyPublish(env: Env, chatId: number, name: string, data: unknown): Promise<void> {
+  if (!env.ABLY_API_KEY) return;
+  try {
+    await fetch(`https://rest.ably.io/channels/${encodeURIComponent(`chat:${chatId}`)}/messages`, {
+      method: "POST",
+      headers: { authorization: `Basic ${btoa(env.ABLY_API_KEY)}`, "content-type": "application/json" },
+      body: JSON.stringify({ name, data: JSON.stringify(data) }),
+    });
+  } catch {
+    // Клиенты при следующем открытии чата загрузят сообщения сами
+  }
+}
+
+// Токен Ably: право подписки только на доступные этому участнику чаты (живёт час)
+async function ablyToken(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  if (!env.ABLY_API_KEY) return json({ error: "Чаты ещё не подключены" }, 503);
+  const capability: Record<string, string[]> = {};
+  for (const id of await accessibleChatIds(env, user)) capability[`chat:${id}`] = ["subscribe"];
+  const keyName = env.ABLY_API_KEY.split(":")[0];
+  const res = await fetch(`https://rest.ably.io/keys/${encodeURIComponent(keyName)}/requestToken`, {
+    method: "POST",
+    headers: { authorization: `Basic ${btoa(env.ABLY_API_KEY)}`, "content-type": "application/json" },
+    body: JSON.stringify({ capability: JSON.stringify(capability), ttl: 3600 * 1000 }),
+  });
+  if (!res.ok) return json({ error: "Не удалось подключить чат" }, 502);
+  return new Response(await res.text(), {
+    headers: { "content-type": "application/json; charset=utf-8", ...CORS },
+  });
+}
+
+async function listChats(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  // Для общего чата и чата комсостава создаём запись о членстве: в ней хранится, что прочитано.
+  // Старые сообщения не считаются непрочитанными.
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO chat_members (chat_id, user_id, last_read_id)
+     SELECT c.id, ?, COALESCE((SELECT MAX(id) FROM messages WHERE chat_id = c.id), 0)
+       FROM chats c WHERE c.kind = 'general' OR (c.kind = 'committee' AND ? = 1)`,
+  )
+    .bind(user.id, isCommittee(user) ? 1 : 0)
+    .run();
+
+  const rows = await env.DB.prepare(
+    `SELECT c.id, c.kind, c.title,
+            (SELECT body FROM messages WHERE chat_id = c.id AND deleted = 0 ORDER BY id DESC LIMIT 1) AS last_body,
+            (SELECT attachment_kind FROM messages WHERE chat_id = c.id AND deleted = 0 ORDER BY id DESC LIMIT 1) AS last_kind,
+            (SELECT created_at FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1) AS last_at,
+            (SELECT u.full_name FROM chat_members x JOIN users u ON u.id = x.user_id
+              WHERE x.chat_id = c.id AND x.user_id <> ? LIMIT 1) AS other_name,
+            (SELECT COUNT(*) FROM messages WHERE chat_id = c.id AND deleted = 0 AND author_id <> ?
+              AND id > COALESCE(m.last_read_id, 0)) AS unread
+       FROM chats c
+       JOIN chat_members m ON m.chat_id = c.id AND m.user_id = ?
+      ORDER BY COALESCE((SELECT created_at FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1), c.created_at) DESC`,
+  )
+    .bind(user.id, user.id, user.id)
+    .all<{
+      id: number;
+      kind: string;
+      title: string | null;
+      last_body: string | null;
+      last_kind: string | null;
+      last_at: string | null;
+      other_name: string | null;
+      unread: number;
+    }>();
+
+  const chats = rows.results.map((r) => ({
+    id: r.id,
+    kind: r.kind,
+    title: r.kind === "personal" ? r.other_name ?? "Личный чат" : r.title ?? "",
+    last_body: r.last_body,
+    last_kind: r.last_kind,
+    last_at: r.last_at,
+    unread: r.unread,
+  }));
+  return json({ chats });
+}
+
+async function createChat(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+
+  if (body.kind === "personal") {
+    const otherId = Number(body.user_id);
+    if (!Number.isInteger(otherId) || otherId === user.id) return json({ error: "Выберите собеседника" }, 400);
+    const other = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'")
+      .bind(otherId)
+      .first();
+    if (!other) return json({ error: "Участник не найден" }, 404);
+    const key = `${Math.min(user.id, otherId)}:${Math.max(user.id, otherId)}`;
+    const existing = await env.DB.prepare("SELECT id FROM chats WHERE personal_key = ?")
+      .bind(key)
+      .first<{ id: number }>();
+    if (existing) return json({ id: existing.id });
+    const res = await env.DB.prepare("INSERT INTO chats (kind, personal_key, created_by) VALUES ('personal', ?, ?)")
+      .bind(key, user.id)
+      .run();
+    const id = Number(res.meta.last_row_id);
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)").bind(id, user.id),
+      env.DB.prepare("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)").bind(id, otherId),
+    ]);
+    return json({ id }, 201);
+  }
+
+  if (body.kind === "group") {
+    const title = str(body.title, 60);
+    if (!title) return json({ error: "Введите название группы" }, 400);
+    const wanted = new Set<number>([user.id]);
+    if (Array.isArray(body.member_ids)) {
+      for (const v of body.member_ids) {
+        const n = Number(v);
+        if (Number.isInteger(n) && n > 0) wanted.add(n);
+      }
+    }
+    const members: number[] = [];
+    for (const id of wanted) {
+      const ok = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'").bind(id).first();
+      if (ok) members.push(id);
+    }
+    if (members.length < 2) return json({ error: "Добавьте хотя бы одного участника" }, 400);
+    const res = await env.DB.prepare("INSERT INTO chats (kind, title, created_by) VALUES ('group', ?, ?)")
+      .bind(title, user.id)
+      .run();
+    const id = Number(res.meta.last_row_id);
+    await env.DB.batch(
+      members.map((m) => env.DB.prepare("INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)").bind(id, m)),
+    );
+    return json({ id }, 201);
+  }
+
+  return json({ error: "Неизвестный тип чата" }, 400);
+}
+
+function publicMessage(r: MessageRow): Record<string, unknown> {
+  const deleted = !!r.deleted;
+  return {
+    id: r.id,
+    chat_id: r.chat_id,
+    author_id: r.author_id,
+    author_name: r.author_name,
+    body: deleted ? "" : r.body,
+    attachment_id: deleted ? null : r.attachment_id,
+    attachment_name: deleted ? null : r.attachment_name,
+    attachment_kind: deleted ? null : r.attachment_kind,
+    created_at: r.created_at,
+    edited_at: r.edited_at,
+    deleted,
+  };
+}
+
+const MESSAGE_SELECT = `SELECT m.id, m.chat_id, m.author_id, u.full_name AS author_name, m.body,
+       m.attachment_id, m.attachment_name, m.attachment_kind, m.created_at, m.edited_at, m.deleted
+  FROM messages m JOIN users u ON u.id = m.author_id`;
+
+async function listMessages(request: Request, env: Env, chatId: number, url: URL): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+
+  const after = Number(url.searchParams.get("after") ?? 0);
+  const before = Number(url.searchParams.get("before") ?? 0);
+  let rows: MessageRow[];
+  if (after > 0) {
+    rows = (
+      await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.chat_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT 100`)
+        .bind(chatId, after)
+        .all<MessageRow>()
+    ).results;
+  } else {
+    const limit = 50;
+    const sql = before > 0
+      ? `${MESSAGE_SELECT} WHERE m.chat_id = ? AND m.id < ? ORDER BY m.id DESC LIMIT ${limit}`
+      : `${MESSAGE_SELECT} WHERE m.chat_id = ? ORDER BY m.id DESC LIMIT ${limit}`;
+    const stmt = before > 0 ? env.DB.prepare(sql).bind(chatId, before) : env.DB.prepare(sql).bind(chatId);
+    rows = (await stmt.all<MessageRow>()).results.reverse();
+  }
+
+  const reactions = await loadReactions(
+    env,
+    "message",
+    rows.map((r) => r.id),
+    user.id,
+  );
+  return json({
+    messages: rows.map((r) => ({ ...publicMessage(r), reactions: reactions.get(r.id) ?? [] })),
+    viewer_id: user.id,
+    viewer_committee: isCommittee(user),
+  });
+}
+
+async function sendMessage(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+
+  const body = await readJson(request);
+  const text = str(body.body, CHAT_MESSAGE_MAX);
+  const attachmentId = str(body.attachment_id, 64);
+  const attachmentName = str(body.attachment_name, 200) || null;
+  const attachmentKind = body.attachment_kind === "image" ? "image" : attachmentId ? "file" : null;
+  if (attachmentId && !/^[A-Za-z0-9_-]{10,64}$/.test(attachmentId)) return json({ error: "Неверный файл" }, 400);
+  if (!text && !attachmentId) return json({ error: "Напишите сообщение или прикрепите файл" }, 400);
+
+  const res = await env.DB.prepare(
+    `INSERT INTO messages (chat_id, author_id, body, attachment_id, attachment_name, attachment_kind)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(chatId, user.id, text, attachmentId || null, attachmentName, attachmentKind)
+    .run();
+  const row = await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`)
+    .bind(Number(res.meta.last_row_id))
+    .first<MessageRow>();
+  if (!row) return json({ error: "Не удалось сохранить" }, 500);
+  const message = { ...publicMessage(row), reactions: [] };
+  await ablyPublish(env, chatId, "message", message);
+  return json({ message }, 201);
+}
+
+async function editMessage(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const row = await env.DB.prepare("SELECT author_id, chat_id, deleted FROM messages WHERE id = ?")
+    .bind(id)
+    .first<{ author_id: number; chat_id: number; deleted: number }>();
+  if (!row) return json({ error: "Сообщение не найдено" }, 404);
+  if (row.author_id !== user.id) return json({ error: "Редактировать можно только свои сообщения" }, 403);
+  if (row.deleted) return json({ error: "Сообщение удалено" }, 400);
+  const text = str((await readJson(request)).body, CHAT_MESSAGE_MAX);
+  if (!text) return json({ error: "Текст не может быть пустым" }, 400);
+  const editedAt = new Date().toISOString();
+  await env.DB.prepare("UPDATE messages SET body = ?, edited_at = ? WHERE id = ?").bind(text, editedAt, id).run();
+  await ablyPublish(env, row.chat_id, "edit", { id, chat_id: row.chat_id, body: text, edited_at: editedAt });
+  return json({ ok: true });
+}
+
+async function deleteMessage(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const row = await env.DB.prepare("SELECT author_id, chat_id FROM messages WHERE id = ?")
+    .bind(id)
+    .first<{ author_id: number; chat_id: number }>();
+  if (!row) return json({ error: "Сообщение не найдено" }, 404);
+  if (row.author_id !== user.id) {
+    // Комсостав может удалять чужие сообщения только в общем чате и в чате комсостава
+    const chat = await chatById(env, row.chat_id);
+    const moderated = chat?.kind === "general" || chat?.kind === "committee";
+    if (!(isCommittee(user) && moderated)) return json({ error: "Нет доступа" }, 403);
+  }
+  await env.DB.prepare("UPDATE messages SET deleted = 1, body = '', attachment_id = NULL WHERE id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM reactions WHERE target_type = 'message' AND target_id = ?").bind(id).run();
+  await ablyPublish(env, row.chat_id, "delete", { id, chat_id: row.chat_id });
+  return json({ ok: true });
+}
+
+async function markRead(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const lastId = Number((await readJson(request)).last_id);
+  if (!Number.isInteger(lastId) || lastId < 0) return json({ error: "Неверный номер сообщения" }, 400);
+  await env.DB.prepare(
+    `INSERT INTO chat_members (chat_id, user_id, last_read_id) VALUES (?, ?, ?)
+     ON CONFLICT (chat_id, user_id) DO UPDATE SET last_read_id = MAX(last_read_id, excluded.last_read_id)`,
+  )
+    .bind(chatId, user.id, lastId)
+    .run();
+  return json({ ok: true });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -1101,6 +1441,18 @@ export default {
           ? await getPrivateProfile(request, env, id)
           : await getProfile(request, env, id);
       }
+
+      if (method === "GET" && path === "/api/ably/token") return await ablyToken(request, env);
+      if (method === "GET" && path === "/api/chats") return await listChats(request, env);
+      if (method === "POST" && path === "/api/chats") return await createChat(request, env);
+      const chatMessagesMatch = path.match(/^\/api\/chats\/(\d+)\/messages$/);
+      if (chatMessagesMatch && method === "GET") return await listMessages(request, env, Number(chatMessagesMatch[1]), url);
+      if (chatMessagesMatch && method === "POST") return await sendMessage(request, env, Number(chatMessagesMatch[1]));
+      const chatReadMatch = path.match(/^\/api\/chats\/(\d+)\/read$/);
+      if (chatReadMatch && method === "POST") return await markRead(request, env, Number(chatReadMatch[1]));
+      const messageMatch = path.match(/^\/api\/messages\/(\d+)$/);
+      if (messageMatch && method === "PUT") return await editMessage(request, env, Number(messageMatch[1]));
+      if (messageMatch && method === "DELETE") return await deleteMessage(request, env, Number(messageMatch[1]));
 
       if (method === "GET" && path === "/api/info") return await listInfo(request, env);
       const infoMatch = path.match(/^\/api\/info\/([a-z0-9-]{1,40})$/);

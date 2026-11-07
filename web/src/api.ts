@@ -144,6 +144,13 @@ export async function downloadAttachment(id: string, name: string): Promise<stri
 }
 
 // Картинка с защищённого адреса: браузер сам не передаёт заголовок входа, поэтому грузим через fetch
+// Картинка из чата (вложение). Возвращает адрес для тега img.
+export async function loadAttachmentUrl(id: string): Promise<string | null> {
+  const res = await fetch(baseUrl() + `/api/attachments/${id}`, { headers: authHeaders() });
+  if (!res.ok) return null;
+  return URL.createObjectURL(await res.blob());
+}
+
 export async function loadImage(id: string): Promise<string | null> {
   const res = await fetch(baseUrl() + `/api/files/${id}`, { headers: authHeaders() });
   if (!res.ok) return null;
