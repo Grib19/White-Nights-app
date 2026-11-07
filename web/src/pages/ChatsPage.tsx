@@ -612,7 +612,7 @@ function ChatView({
           e.preventDefault();
           sendText();
         }}
-        style={{ display: "flex", gap: 8, alignItems: "flex-end", marginTop: 8 }}
+        style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8, background: "#17212b", borderRadius: 24, padding: "4px 8px 4px 6px" }}
       >
         <input
           ref={fileRef}
@@ -623,8 +623,14 @@ function ChatView({
             if (f) attach(f);
           }}
         />
-        <button type="button" onClick={() => fileRef.current?.click()} disabled={busy || !!editing} style={{ ...inlineButton, padding: "8px 12px" }}>
-          Прикрепить
+        <button
+          type="button"
+          onClick={() => fileRef.current?.click()}
+          disabled={busy || !!editing}
+          aria-label="Прикрепить файл"
+          style={composerIconButton}
+        >
+          <ClipIcon />
         </button>
         <textarea
           value={text}
@@ -635,15 +641,97 @@ function ChatView({
               sendText();
             }
           }}
-          rows={2}
-          placeholder="Написать сообщение"
-          style={{ ...input, flex: 1, resize: "none" }}
+          rows={1}
+          placeholder="Сообщение..."
+          style={{
+            flex: 1,
+            resize: "none",
+            background: "transparent",
+            border: "none",
+            outline: "none",
+            color: "#f5f5f5",
+            fontSize: 16,
+            fontFamily: "inherit",
+            padding: "8px 4px",
+            maxHeight: 120,
+          }}
         />
-        <button type="submit" style={inlineButton} disabled={busy || !text.trim()}>
-          {editing ? "Сохранить" : "Отправить"}
-        </button>
+        {text.trim() || editing ? (
+          <button type="submit" disabled={busy || !text.trim()} aria-label={editing ? "Сохранить" : "Отправить"} style={composerIconButton}>
+            <SendIcon />
+          </button>
+        ) : (
+          <>
+            <button type="button" disabled aria-label="Смайлики" style={composerIconButton}>
+              <SmileIcon />
+            </button>
+            <button type="button" disabled aria-label="Голосовое сообщение" style={composerIconButton}>
+              <MicIcon />
+            </button>
+          </>
+        )}
       </form>
     </div>
+  );
+}
+
+const composerIconButton: CSSProperties = {
+  background: "none",
+  border: "none",
+  padding: 6,
+  cursor: "pointer",
+  color: "#6c7883",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  flexShrink: 0,
+};
+
+const iconProps = {
+  width: 24,
+  height: 24,
+  viewBox: "0 0 24 24",
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.8,
+  strokeLinecap: "round" as const,
+  strokeLinejoin: "round" as const,
+  "aria-hidden": true,
+};
+
+function ClipIcon() {
+  return (
+    <svg {...iconProps}>
+      <path d="M21 11.5l-8.5 8.5a5 5 0 0 1-7-7l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 0 1-2.8-2.8l8.2-8.2" />
+    </svg>
+  );
+}
+
+function SmileIcon() {
+  return (
+    <svg {...iconProps}>
+      <circle cx="12" cy="12" r="9.5" />
+      <path d="M8 14.2c1 1.3 2.4 2 4 2s3-.7 4-2" />
+      <circle cx="9" cy="10" r="0.8" fill="currentColor" />
+      <circle cx="15" cy="10" r="0.8" fill="currentColor" />
+    </svg>
+  );
+}
+
+function MicIcon() {
+  return (
+    <svg {...iconProps}>
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3" />
+    </svg>
+  );
+}
+
+function SendIcon() {
+  return (
+    <svg {...iconProps} stroke="#5ca9e6">
+      <path d="M4 12l16-8-6 16-2.5-6.5z" />
+    </svg>
   );
 }
 
