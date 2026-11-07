@@ -1172,6 +1172,17 @@ async function ablyToken(request: Request, env: Env): Promise<Response> {
 async function listChats(request: Request, env: Env): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
+  // «Избранное» — личный чат самого пользователя: создаём, если его ещё нет
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO chats (kind, title, personal_key, created_by) VALUES ('favorites', 'Избранное', ?, ?)",
+  )
+    .bind(`fav:${user.id}`, user.id)
+    .run();
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO chat_members (chat_id, user_id, last_read_id) SELECT id, ?, 0 FROM chats WHERE personal_key = ?",
+  )
+    .bind(user.id, `fav:${user.id}`)
+    .run();
   // Для общего чата и чата комсостава создаём запись о членстве: в ней хранится, что прочитано.
   // Старые сообщения не считаются непрочитанными.
   await env.DB.prepare(
@@ -1441,7 +1452,7 @@ async function setChatPhoto(request: Request, env: Env, chatId: number): Promise
   if (!user) return json({ error: "Нужен вход" }, 401);
   const chat = await chatById(env, chatId);
   if (!chat) return json({ error: "Чат не найден" }, 404);
-  if (chat.kind === "personal") return json({ error: "У личного чата нет своего фото" }, 400);
+  if (chat.kind === "personal" || chat.kind === "favorites") return json({ error: "У этого чата нет своего фото" }, 400);
   if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
   if ((chat.kind === "general" || chat.kind === "committee") && !isCommittee(user)) {
     return json({ error: "Фото этого чата меняет комсостав" }, 403);
@@ -1521,7 +1532,7 @@ async function updateChatSettings(request: Request, env: Env, chatId: number): P
     .bind(chatId)
     .first<{ id: number; kind: string; title: string; description: string | null; invite_mode: string; edit_mode: string; created_by: number | null }>();
   if (!chat) return json({ error: "Чат не найден" }, 404);
-  if (chat.kind === "personal") return json({ error: "У личного чата нет настроек" }, 400);
+  if (chat.kind === "personal" || chat.kind === "favorites") return json({ error: "У этого чата нет настроек" }, 400);
 
   const isCreator = chat.created_by === user.id;
   if (chat.kind === "group") {
