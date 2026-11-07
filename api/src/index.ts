@@ -1314,15 +1314,15 @@ async function listMessages(request: Request, env: Env, chatId: number, url: URL
   let rows: MessageRow[];
   if (after > 0) {
     rows = (
-      await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.chat_id = ? AND m.id > ? ORDER BY m.id ASC LIMIT 100`)
+      await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.chat_id = ? AND m.id > ? AND m.deleted = 0 ORDER BY m.id ASC LIMIT 100`)
         .bind(chatId, after)
         .all<MessageRow>()
     ).results;
   } else {
     const limit = 50;
     const sql = before > 0
-      ? `${MESSAGE_SELECT} WHERE m.chat_id = ? AND m.id < ? ORDER BY m.id DESC LIMIT ${limit}`
-      : `${MESSAGE_SELECT} WHERE m.chat_id = ? ORDER BY m.id DESC LIMIT ${limit}`;
+      ? `${MESSAGE_SELECT} WHERE m.chat_id = ? AND m.id < ? AND m.deleted = 0 ORDER BY m.id DESC LIMIT ${limit}`
+      : `${MESSAGE_SELECT} WHERE m.chat_id = ? AND m.deleted = 0 ORDER BY m.id DESC LIMIT ${limit}`;
     const stmt = before > 0 ? env.DB.prepare(sql).bind(chatId, before) : env.DB.prepare(sql).bind(chatId);
     rows = (await stmt.all<MessageRow>()).results.reverse();
   }
@@ -1400,8 +1400,12 @@ async function deleteMessage(request: Request, env: Env, id: number): Promise<Re
     const moderated = chat?.kind === "general" || chat?.kind === "committee";
     if (!(isCommittee(user) && moderated)) return json({ error: "Нет доступа" }, 403);
   }
-  await env.DB.prepare("UPDATE messages SET deleted = 1, body = '', attachment_id = NULL WHERE id = ?").bind(id).run();
+  const attachment = await env.DB.prepare("SELECT attachment_id FROM messages WHERE id = ?")
+    .bind(id)
+    .first<{ attachment_id: string | null }>();
   await env.DB.prepare("DELETE FROM reactions WHERE target_type = 'message' AND target_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM messages WHERE id = ?").bind(id).run();
+  if (attachment?.attachment_id) await env.FILES.delete(`att:${attachment.attachment_id}`);
   await ablyPublish(env, row.chat_id, "delete", { id, chat_id: row.chat_id });
   return json({ ok: true });
 }

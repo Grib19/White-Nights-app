@@ -377,7 +377,7 @@ function ChatView({
     };
     const onDelete = (m: Ably.Message) => {
       const d = parseEvent<{ id: number }>(m.data);
-      setMessages((prev) => prev.map((x) => (x.id === d.id ? { ...x, body: "", deleted: true, attachment_id: null } : x)));
+      setMessages((prev) => prev.filter((x) => x.id !== d.id));
     };
     const onReact = () => loadLatest();
     channel.subscribe("message", onMessage);
@@ -467,7 +467,7 @@ function ChatView({
     if (!window.confirm("Удалить сообщение?")) return;
     const { status, data } = await request(`/api/messages/${m.id}`, "DELETE");
     if (status === 200) {
-      setMessages((prev) => prev.map((x) => (x.id === m.id ? { ...x, body: "", deleted: true, attachment_id: null } : x)));
+      setMessages((prev) => prev.filter((x) => x.id !== m.id));
     } else setErr(data.error ?? "Не удалось удалить");
   }
 
