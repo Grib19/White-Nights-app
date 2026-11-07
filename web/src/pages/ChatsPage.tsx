@@ -77,9 +77,6 @@ export function ChatsPage({ viewer }: { viewer: User }) {
   const [showNew, setShowNew] = useState(false);
   const [error, setError] = useState("");
   const [ably, setAbly] = useState<Ably.Realtime | null>(null);
-  const [notifyState, setNotifyState] = useState<string>(
-    typeof Notification === "undefined" ? "unsupported" : Notification.permission,
-  );
   const [wide, setWide] = useState(() => window.innerWidth >= 760);
   const subscribed = useRef(new Set<number>());
   const activeRef = useRef<number | null>(null);
@@ -146,12 +143,6 @@ export function ChatsPage({ viewer }: { viewer: User }) {
     }
   }
 
-  async function allowNotifications() {
-    if (typeof Notification === "undefined") return;
-    const result = await Notification.requestPermission();
-    setNotifyState(result);
-  }
-
   async function chatCreated(id: number) {
     // Новый чат появился в правах доступа: просим Ably выдать обновлённый токен
     await ably?.auth.authorize().catch(() => undefined);
@@ -170,14 +161,6 @@ export function ChatsPage({ viewer }: { viewer: User }) {
             <b style={{ fontSize: 18 }}>Чаты</b>
             <button style={inlineButton} onClick={() => setShowNew(true)}>+ Новый чат</button>
           </div>
-          {notifyState === "default" && (
-            <button
-              onClick={allowNotifications}
-              style={{ background: "none", border: "none", color: colors.blue, textDecoration: "underline", cursor: "pointer", padding: 0, fontSize: 13, marginBottom: 8 }}
-            >
-              Включить уведомления о новых сообщениях
-            </button>
-          )}
           {error && <p style={{ color: "#b00020" }}>{error}</p>}
           {chats.map((c) => (
             <button
