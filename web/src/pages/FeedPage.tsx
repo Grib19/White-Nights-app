@@ -1,6 +1,9 @@
 import { CSSProperties, FormEvent, useEffect, useState } from "react";
 import { User, downloadAttachment, loadImage, request, uploadAttachment, uploadFile } from "../api";
 import { button, card, colors, input, tabButton } from "../styles";
+
+// Белое окно поста делаем тёмным
+const darkCard = { ...card, background: "#0b1420", color: "#f5f5f5" };
 import { TabIcon } from "../TabIcon";
 
 interface PollOption {
@@ -192,9 +195,9 @@ export function FeedPage({ viewer }: { viewer: User }) {
       </div>
 
       {!canWrite && (
-        <div style={card}>В «Важное» пишет комсостав и участники, которым комсостав разрешил.</div>
+        <div style={darkCard}>В «Важное» пишет комсостав и участники, которым комсостав разрешил.</div>
       )}
-      {canWrite && <form onSubmit={publish} style={card}>
+      {canWrite && <form onSubmit={publish} style={darkCard}>
         <textarea
           style={{ ...input, minHeight: 90 }}
           placeholder="Что нового в отряде?"
@@ -276,7 +279,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
         </button>
       </form>}
 
-      {posts.length === 0 && <div style={card}>Постов пока нет.</div>}
+      {posts.length === 0 && <div style={darkCard}>Постов пока нет.</div>}
       {posts.map((post) => (
         <PostCard
           key={post.id}
@@ -303,7 +306,7 @@ function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDel
   );
 
   return (
-    <div style={card}>
+    <div style={darkCard}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
         <b>{post.author_name}</b>
         <span style={{ fontSize: 13, color: colors.gray }}>{new Date(post.created_at).toLocaleString("ru-RU")}</span>
@@ -625,7 +628,7 @@ function chip(active: boolean): CSSProperties {
 }
 
 const linkLabel: CSSProperties = {
-  color: colors.navy,
+  color: "#f5f5f5",
   textDecoration: "underline",
   cursor: "pointer",
 };
@@ -633,7 +636,7 @@ const linkLabel: CSSProperties = {
 const linkButton: CSSProperties = {
   background: "none",
   border: "none",
-  color: colors.navy,
+  color: "#f5f5f5",
   textDecoration: "underline",
   cursor: "pointer",
   padding: 0,

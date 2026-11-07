@@ -221,7 +221,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
   return (
     <div style={wide ? { display: "flex", gap: 16, alignItems: "flex-start" } : undefined}>
       {(wide || !active) && (
-        <aside style={{ width: wide ? 300 : "100%", flexShrink: 0, ...card, padding: 12 }}>
+        <aside style={{ width: wide ? 300 : "100%", flexShrink: 0, ...card, background: "#0b1420", color: "#f5f5f5", padding: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
             <b style={{ fontSize: 18 }}>Чаты</b>
             <div style={{ display: "flex", gap: 6 }}>
@@ -246,7 +246,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
                 border: "none",
                 borderRadius: 8,
                 background: c.id === activeId ? colors.yellow : "transparent",
-                color: colors.navy,
+                color: c.id === activeId ? colors.navy : "#f5f5f5",
                 cursor: "pointer",
                 marginBottom: 4,
               }}
@@ -289,7 +289,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
       )}
 
       {!active && wide && (
-        <div style={{ ...card, flex: 1, color: colors.gray }}>Выберите чат слева, чтобы начать переписку.</div>
+        <div style={{ ...card, background: "#0b1420", flex: 1, color: colors.gray }}>Выберите чат слева, чтобы начать переписку.</div>
       )}
 
       {showNew && (
