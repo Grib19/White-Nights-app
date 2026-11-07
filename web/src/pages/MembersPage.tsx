@@ -37,7 +37,7 @@ export function MembersPage({ viewer }: { viewer: User }) {
         <button
           key={m.id}
           onClick={() => setOpenId(m.id)}
-          style={{ ...card, display: "flex", gap: 12, alignItems: "center", width: "100%", textAlign: "left", background: "white", cursor: "pointer" }}
+          style={{ ...card, display: "flex", gap: 12, alignItems: "center", width: "100%", textAlign: "left", background: "#0b1420", cursor: "pointer" }}
         >
           <Avatar photoId={m.photo_id} />
           <div>

@@ -40,8 +40,8 @@ export const button: CSSProperties = {
   cursor: "pointer",
 };
 export const card: CSSProperties = {
-  color: colors.navy,
-  background: colors.white,
+  color: "#f5f5f5",
+  background: "#0b1420",
   borderRadius: 16,
   padding: 24,
   marginBottom: 12,

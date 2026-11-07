@@ -402,7 +402,7 @@ function MessageMenu({
     padding: "10px 16px",
     fontSize: 15,
     cursor: "pointer",
-    color: colors.navy,
+    color: "#f5f5f5",
   };
   return (
     <div
@@ -415,7 +415,7 @@ function MessageMenu({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{ position: "fixed", left, top, width: 260, background: "#fff", borderRadius: 14, boxShadow: "0 6px 24px rgba(0,0,0,0.25)", overflow: "hidden", padding: "6px 0" }}
+        style={{ position: "fixed", left, top, width: 260, background: "#0b1420", borderRadius: 14, boxShadow: "0 6px 24px rgba(0,0,0,0.25)", overflow: "hidden", padding: "6px 0" }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 10px 8px" }}>
           {QUICK_EMOJI.map((emoji) => (
@@ -454,7 +454,7 @@ function ForwardDialog({
   const shown = chats.filter((c) => c.title.toLowerCase().includes(q.trim().toLowerCase()));
   return (
     <Modal onClose={onClose}>
-      <div style={{ fontSize: 18, fontWeight: "bold", color: colors.navy, marginBottom: 10 }}>
+      <div style={{ fontSize: 18, fontWeight: "bold", color: "#f5f5f5", marginBottom: 10 }}>
         Переслать{count > 1 ? ` (${count})` : ""}
       </div>
       <input style={{ ...input, marginBottom: 8 }} placeholder="Поиск чата" value={q} onChange={(e) => setQ(e.target.value)} />
@@ -922,7 +922,7 @@ function ChatView({
 
       {editing && (
         <Modal onClose={() => setEditing(null)}>
-          <div style={{ fontSize: 18, fontWeight: "bold", color: colors.navy }}>Изменить сообщение</div>
+          <div style={{ fontSize: 18, fontWeight: "bold", color: "#f5f5f5" }}>Изменить сообщение</div>
           <textarea
             style={{ ...input, minHeight: 100, resize: "vertical", marginTop: 10 }}
             value={editText}
@@ -938,7 +938,7 @@ function ChatView({
 
       {deleting && (
         <Modal onClose={() => setDeleting(null)}>
-          <div style={{ fontSize: 16, color: colors.navy }}>
+          <div style={{ fontSize: 16, color: "#f5f5f5" }}>
             {deleting.length === 1 ? "Удалить сообщение?" : `Удалить сообщения (${deleting.length})?`} Восстановить нельзя.
           </div>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
@@ -1351,7 +1351,7 @@ function ChatSettingsView({
   return (
     <div style={{ ...card, width: "min(460px, 100%)", maxHeight: "85vh", overflowY: "auto", position: "fixed", top: 60, left: "50%", transform: "translateX(-50%)", zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.3)" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <button onClick={onBack} style={{ ...linkStyle, fontSize: 22, color: colors.navy }} aria-label="Назад">←</button>
+        <button onClick={onBack} style={{ ...linkStyle, fontSize: 22, color: "#f5f5f5" }} aria-label="Назад">←</button>
         <span style={{ fontSize: 18, fontWeight: "bold" }}>Настройки</span>
       </div>
 
@@ -1501,13 +1501,13 @@ function ChatInfoPanel({
     <div style={{ ...card, width: "min(460px, 100%)", maxHeight: "85vh", overflowY: "auto", position: "fixed", top: 60, left: "50%", transform: "translateX(-50%)", zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.3)", textAlign: "center" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         {canEdit ? (
-          <button onClick={() => setEditing(true)} style={{ ...linkStyle, color: colors.navy }} aria-label="Настройки">
+          <button onClick={() => setEditing(true)} style={{ ...linkStyle, color: "#f5f5f5" }} aria-label="Настройки">
             <GearIcon />
           </button>
         ) : (
           <span />
         )}
-        <button onClick={onClose} style={{ ...linkStyle, fontSize: 22, color: colors.navy }} aria-label="Закрыть">×</button>
+        <button onClick={onClose} style={{ ...linkStyle, fontSize: 22, color: "#f5f5f5" }} aria-label="Закрыть">×</button>
       </div>
 
       <div style={{ display: "flex", justifyContent: "center" }}>

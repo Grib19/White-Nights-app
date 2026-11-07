@@ -63,7 +63,7 @@ export function InfoPage({ viewer }: { viewer: User }) {
           <button
             key={d.slug}
             onClick={() => setSlug(d.slug)}
-            style={{ ...card, width: "100%", textAlign: "left", background: "white", cursor: "pointer" }}
+            style={{ ...card, width: "100%", textAlign: "left", background: "#0b1420", cursor: "pointer" }}
           >
             <b>{d.title}</b>
           </button>
@@ -305,7 +305,7 @@ function AudioPlayer({ src }: { src: string }) {
         aria-label="Перемотка"
         style={{ flex: 1, minWidth: 0, accentColor: colors.navy, cursor: "pointer" }}
       />
-      <span style={{ fontSize: 14, color: colors.navy, whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
+      <span style={{ fontSize: 14, color: "#f5f5f5", whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
         {formatTime(current)} / {formatTime(duration)}
       </span>
     </div>

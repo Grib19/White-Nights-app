@@ -648,7 +648,7 @@ const checkRow: CSSProperties = {
   alignItems: "center",
   gap: 8,
   marginTop: 6,
-  color: colors.navy,
+  color: "#f5f5f5",
 };
 
 // Окно «Кто проголосовал»: вкладки по вариантам, число людей, список с именами
@@ -677,8 +677,8 @@ function VotersModal({ poll, onClose }: { poll: Poll; onClose: () => void }) {
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          background: colors.white,
-          color: colors.navy,
+          background: "#0b1420",
+          color: "#f5f5f5",
           borderRadius: 16,
           width: "100%",
           maxWidth: 520,
