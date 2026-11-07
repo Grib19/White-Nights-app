@@ -1181,7 +1181,9 @@ async function listChats(request: Request, env: Env): Promise<Response> {
     .run();
 
   const rows = await env.DB.prepare(
-    `SELECT c.id, c.kind, c.title,
+    `SELECT c.id, c.kind, c.title, c.photo_id,
+            (SELECT p.photo_id FROM chat_members x LEFT JOIN profiles p ON p.user_id = x.user_id
+              WHERE x.chat_id = c.id AND x.user_id <> ? LIMIT 1) AS other_photo,
             (SELECT body FROM messages WHERE chat_id = c.id AND deleted = 0 ORDER BY id DESC LIMIT 1) AS last_body,
             (SELECT attachment_kind FROM messages WHERE chat_id = c.id AND deleted = 0 ORDER BY id DESC LIMIT 1) AS last_kind,
             (SELECT created_at FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1) AS last_at,
@@ -1193,11 +1195,13 @@ async function listChats(request: Request, env: Env): Promise<Response> {
        JOIN chat_members m ON m.chat_id = c.id AND m.user_id = ?
       ORDER BY COALESCE((SELECT created_at FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1), c.created_at) DESC`,
   )
-    .bind(user.id, user.id, user.id)
+    .bind(user.id, user.id, user.id, user.id)
     .all<{
       id: number;
       kind: string;
       title: string | null;
+      photo_id: string | null;
+      other_photo: string | null;
       last_body: string | null;
       last_kind: string | null;
       last_at: string | null;
@@ -1209,6 +1213,7 @@ async function listChats(request: Request, env: Env): Promise<Response> {
     id: r.id,
     kind: r.kind,
     title: r.kind === "personal" ? r.other_name ?? "Личный чат" : r.title ?? "",
+    photo_id: r.kind === "personal" ? r.other_photo : r.photo_id,
     last_body: r.last_body,
     last_kind: r.last_kind,
     last_at: r.last_at,
@@ -1416,6 +1421,23 @@ async function markRead(request: Request, env: Env, chatId: number): Promise<Res
   return json({ ok: true });
 }
 
+// Фото чата: в групповом чате может менять любой участник, в общих чатах — только комсостав
+async function setChatPhoto(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (chat.kind === "personal") return json({ error: "У личного чата нет своего фото" }, 400);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  if ((chat.kind === "general" || chat.kind === "committee") && !isCommittee(user)) {
+    return json({ error: "Фото этого чата меняет комсостав" }, 403);
+  }
+  const photoId = str((await readJson(request)).photo_id, 64);
+  if (photoId && !/^[A-Za-z0-9_-]{10,64}$/.test(photoId)) return json({ error: "Неверное фото" }, 400);
+  await env.DB.prepare("UPDATE chats SET photo_id = ? WHERE id = ?").bind(photoId || null, chatId).run();
+  return json({ ok: true });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -1448,6 +1470,8 @@ export default {
       const chatMessagesMatch = path.match(/^\/api\/chats\/(\d+)\/messages$/);
       if (chatMessagesMatch && method === "GET") return await listMessages(request, env, Number(chatMessagesMatch[1]), url);
       if (chatMessagesMatch && method === "POST") return await sendMessage(request, env, Number(chatMessagesMatch[1]));
+      const chatPhotoMatch = path.match(/^\/api\/chats\/(\d+)\/photo$/);
+      if (chatPhotoMatch && method === "PUT") return await setChatPhoto(request, env, Number(chatPhotoMatch[1]));
       const chatReadMatch = path.match(/^\/api\/chats\/(\d+)\/read$/);
       if (chatReadMatch && method === "POST") return await markRead(request, env, Number(chatReadMatch[1]));
       const messageMatch = path.match(/^\/api\/messages\/(\d+)$/);

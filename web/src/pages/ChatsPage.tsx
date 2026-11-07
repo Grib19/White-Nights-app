@@ -2,7 +2,7 @@
 // Новые сообщения приходят через Ably, без перезагрузки страницы.
 import { CSSProperties, FormEvent, useEffect, useRef, useState } from "react";
 import * as Ably from "ably";
-import { COMMITTEE_ROLES, User, downloadAttachment, loadAttachmentUrl, request, uploadAttachment } from "../api";
+import { COMMITTEE_ROLES, User, downloadAttachment, loadAttachmentUrl, loadImage, request, uploadAttachment, uploadFile } from "../api";
 import { button, card, colors, input } from "../styles";
 
 // Кнопки в строках и шапке не растягиваются на всю ширину
@@ -14,6 +14,7 @@ interface ChatItem {
   id: number;
   kind: string;
   title: string;
+  photo_id: string | null;
   last_body: string | null;
   last_kind: string | null;
   last_at: string | null;
@@ -45,6 +46,58 @@ interface Msg {
 const PAGE = 50;
 const MAX_FILE = 20 * 1024 * 1024;
 
+// Настройки уведомлений: хранятся в браузере на этом устройстве
+function readSetting(key: string, fallback: boolean): boolean {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v === "1";
+  } catch {
+    return fallback;
+  }
+}
+
+function writeSetting(key: string, value: boolean): void {
+  try {
+    localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    // Настройка не сохранится, но чат работает
+  }
+}
+
+// Аватарка: фото, а если его нет — первая буква названия
+function ChatAvatar({ photoId, title, size = 40 }: { photoId: string | null; title: string; size?: number }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let url: string | null = null;
+    setSrc(null);
+    if (photoId) {
+      loadImage(photoId).then((u) => {
+        url = u;
+        setSrc(u);
+      });
+    }
+    return () => {
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [photoId]);
+  const box: CSSProperties = {
+    width: size,
+    height: size,
+    borderRadius: "50%",
+    flexShrink: 0,
+    overflow: "hidden",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: colors.yellow,
+    color: colors.navy,
+    fontWeight: "bold",
+    fontSize: size / 2.5,
+  };
+  if (src) return <img src={src} alt="" style={{ ...box, objectFit: "cover", background: "none" }} />;
+  return <div style={box}>{(title.trim()[0] ?? "?").toUpperCase()}</div>;
+}
+
 function parseEvent<T>(data: unknown): T {
   return (typeof data === "string" ? JSON.parse(data) : data) as T;
 }
@@ -75,6 +128,8 @@ export function ChatsPage({ viewer }: { viewer: User }) {
   const [chats, setChats] = useState<ChatItem[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [ably, setAbly] = useState<Ably.Realtime | null>(null);
   const [wide, setWide] = useState(() => window.innerWidth >= 760);
@@ -132,10 +187,12 @@ export function ChatsPage({ viewer }: { viewer: User }) {
   }, [chats, ably]);
 
   function notify(msg: Msg) {
+    if (!readSetting("chat-notify", false)) return;
     if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    const preview = readSetting("chat-notify-preview", true);
     try {
       new Notification(msg.author_name, {
-        body: msg.body || (msg.attachment_kind === "image" ? "📷 Фото" : "📎 Файл"),
+        body: !preview ? "Новое сообщение" : msg.body || (msg.attachment_kind === "image" ? "📷 Фото" : "📎 Файл"),
         tag: `chat-${msg.chat_id}`,
       });
     } catch {
@@ -152,6 +209,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
   }
 
   const active = chats.find((c) => c.id === activeId) ?? null;
+  const shownChats = chats.filter((c) => c.title.toLowerCase().includes(query.trim().toLowerCase()));
 
   return (
     <div style={wide ? { display: "flex", gap: 16, alignItems: "flex-start" } : undefined}>
@@ -159,10 +217,14 @@ export function ChatsPage({ viewer }: { viewer: User }) {
         <aside style={{ width: wide ? 300 : "100%", flexShrink: 0, ...card, padding: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
             <b style={{ fontSize: 18 }}>Чаты</b>
-            <button style={inlineButton} onClick={() => setShowNew(true)}>+ Новый чат</button>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button style={{ ...inlineButton, padding: "6px 10px", fontSize: 13 }} onClick={() => setShowSettings(true)}>Настройки</button>
+              <button style={{ ...inlineButton, padding: "6px 10px", fontSize: 13 }} onClick={() => setShowNew(true)}>+ Новый чат</button>
+            </div>
           </div>
+          <input style={{ ...input, marginBottom: 8 }} placeholder="Поиск чатов" value={query} onChange={(e) => setQuery(e.target.value)} />
           {error && <p style={{ color: "#b00020" }}>{error}</p>}
-          {chats.map((c) => (
+          {shownChats.map((c) => (
             <button
               key={c.id}
               onClick={() => setActiveId(c.id)}
@@ -182,6 +244,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
                 marginBottom: 4,
               }}
             >
+              <ChatAvatar photoId={c.photo_id} title={c.title} size={36} />
               <span style={{ minWidth: 0, flex: 1 }}>
                 <div style={{ fontWeight: "bold", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{c.title}</div>
                 <div style={{ fontSize: 13, color: colors.gray, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -199,6 +262,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
             </button>
           ))}
           {chats.length === 0 && <p style={{ color: colors.gray }}>Чатов пока нет.</p>}
+          {chats.length > 0 && shownChats.length === 0 && <p style={{ color: colors.gray }}>Ничего не найдено.</p>}
         </aside>
       )}
 
@@ -211,6 +275,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
             ably={ably}
             onBack={wide ? undefined : () => setActiveId(null)}
             onRead={loadChats}
+            onChanged={loadChats}
           />
         </section>
       )}
@@ -222,6 +287,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
       {showNew && (
         <NewChatPanel viewerId={viewer.id} onCreated={chatCreated} onClose={() => setShowNew(false)} />
       )}
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
     </div>
   );
 }
@@ -232,12 +298,14 @@ function ChatView({
   ably,
   onBack,
   onRead,
+  onChanged,
 }: {
   chat: ChatItem;
   viewer: User;
   ably: Ably.Realtime | null;
   onBack?: () => void;
   onRead: () => void;
+  onChanged: () => void;
 }) {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -249,6 +317,21 @@ function ChatView({
   const bottomRef = useRef<HTMLDivElement>(null);
   const committee = COMMITTEE_ROLES.includes(viewer.role);
   const moderated = committee && (chat.kind === "general" || chat.kind === "committee");
+  // Фото меняет любой участник группы, а фото общих чатов — только комсостав
+  const canSetPhoto = chat.kind === "group" || (committee && (chat.kind === "general" || chat.kind === "committee"));
+  const photoRef = useRef<HTMLInputElement>(null);
+
+  async function setPhoto(file: File) {
+    setErr("");
+    const up = await uploadFile(file);
+    if (!up.ok || !up.id) {
+      setErr(up.error ?? "Не удалось загрузить фото");
+      return;
+    }
+    const { status, data } = await request(`/api/chats/${chat.id}/photo`, "PUT", { photo_id: up.id });
+    if (status === 200) onChanged();
+    else setErr(data.error ?? "Не удалось сменить фото");
+  }
 
   function merge(incoming: Msg[]) {
     setMessages((prev) => {
@@ -401,7 +484,24 @@ function ChatView({
             ← Назад
           </button>
         )}
-        <b style={{ fontSize: 18 }}>{chat.title}</b>
+        <ChatAvatar photoId={chat.photo_id} title={chat.title} size={36} />
+        <b style={{ fontSize: 18, flex: 1 }}>{chat.title}</b>
+        {canSetPhoto && (
+          <>
+            <input
+              ref={photoRef}
+              type="file"
+              accept="image/*"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) setPhoto(f);
+                if (photoRef.current) photoRef.current.value = "";
+              }}
+            />
+            <button onClick={() => photoRef.current?.click()} style={linkStyle}>Фото чата</button>
+          </>
+        )}
       </div>
 
       <div style={{ height: "calc(100vh - 300px)", minHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, padding: "4px 2px" }}>
@@ -560,6 +660,8 @@ function NewChatPanel({
   const [title, setTitle] = useState("");
   const [picked, setPicked] = useState<number[]>([]);
   const [err, setErr] = useState("");
+  const [search, setSearch] = useState("");
+  const found = users.filter((u) => u.full_name.toLowerCase().includes(search.trim().toLowerCase()));
 
   useEffect(() => {
     request("/api/profiles").then(({ status, data }) => {
@@ -591,13 +693,31 @@ function NewChatPanel({
         <button style={{ ...inlineButton, opacity: mode === "group" ? 1 : 0.6 }} onClick={() => setMode("group")}>Группа</button>
       </div>
 
+      <input style={{ ...input, marginBottom: 8 }} placeholder="Поиск участника" value={search} onChange={(e) => setSearch(e.target.value)} />
       {mode === "personal" ? (
-        <select style={input} value={personalId ?? ""} onChange={(e) => setPersonalId(Number(e.target.value) || null)}>
-          <option value="">Выберите участника</option>
-          {users.map((u) => (
-            <option key={u.id} value={u.id}>{u.full_name}</option>
+        <div style={{ maxHeight: 240, overflowY: "auto" }}>
+          {found.map((u) => (
+            <button
+              key={u.id}
+              onClick={() => setPersonalId(u.id)}
+              style={{
+                display: "block",
+                width: "100%",
+                textAlign: "left",
+                padding: "8px 10px",
+                border: "none",
+                borderRadius: 8,
+                marginBottom: 4,
+                cursor: "pointer",
+                background: personalId === u.id ? colors.yellow : colors.field,
+                color: colors.navy,
+              }}
+            >
+              {u.full_name}
+            </button>
           ))}
-        </select>
+          {found.length === 0 && <p style={{ color: colors.gray }}>Никого не найдено.</p>}
+        </div>
       ) : (
         <>
           <label>
@@ -605,7 +725,7 @@ function NewChatPanel({
             <input style={input} value={title} onChange={(e) => setTitle(e.target.value)} maxLength={60} />
           </label>
           <div style={{ maxHeight: 220, overflowY: "auto", marginTop: 8 }}>
-            {users.map((u) => (
+            {found.map((u) => (
               <label key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
                 <input
                   type="checkbox"
@@ -624,6 +744,49 @@ function NewChatPanel({
         <button style={inlineButton} onClick={create}>Создать</button>
         <button style={inlineButton} onClick={onClose}>Отмена</button>
       </div>
+    </div>
+  );
+}
+
+function SettingsPanel({ onClose }: { onClose: () => void }) {
+  const [notify, setNotify] = useState(() => readSetting("chat-notify", false));
+  const [preview, setPreview] = useState(() => readSetting("chat-notify-preview", true));
+  const [note, setNote] = useState("");
+
+  async function toggleNotify(on: boolean) {
+    setNote("");
+    if (on && typeof Notification !== "undefined" && Notification.permission !== "granted") {
+      const result = await Notification.requestPermission();
+      if (result !== "granted") {
+        setNote("Браузер не разрешил уведомления. Разрешите их в настройках сайта.");
+        return;
+      }
+    }
+    writeSetting("chat-notify", on);
+    setNotify(on);
+  }
+
+  function togglePreview(on: boolean) {
+    writeSetting("chat-notify-preview", on);
+    setPreview(on);
+  }
+
+  const row: CSSProperties = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "10px 0", borderBottom: `1px solid ${colors.field}` };
+
+  return (
+    <div style={{ ...card, width: "min(420px, 100%)", position: "fixed", top: 80, left: "50%", transform: "translateX(-50%)", zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.3)" }}>
+      <b style={{ fontSize: 18 }}>Настройки чатов</b>
+      <div style={row}>
+        <span>Уведомления о новых сообщениях</span>
+        <input type="checkbox" checked={notify} onChange={(e) => toggleNotify(e.target.checked)} />
+      </div>
+      <div style={row}>
+        <span>Показывать текст в уведомлении</span>
+        <input type="checkbox" checked={preview} disabled={!notify} onChange={(e) => togglePreview(e.target.checked)} />
+      </div>
+      {note && <p style={{ color: "#b00020", fontSize: 13 }}>{note}</p>}
+      <p style={{ color: colors.gray, fontSize: 13 }}>Настройки действуют только на этом устройстве.</p>
+      <button style={{ ...button, width: "auto", padding: "8px 16px" }} onClick={onClose}>Готово</button>
     </div>
   );
 }
