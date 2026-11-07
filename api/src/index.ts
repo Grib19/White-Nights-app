@@ -1092,6 +1092,8 @@ async function deleteSong(request: Request, env: Env, id: string): Promise<Respo
 // Сообщения хранятся в D1, а доставляются в реальном времени через Ably.
 // Браузер получает токен только с правом подписки на чаты, которые ему доступны.
 
+const CHAT_MESSAGE_MAX = 2000;
+
 interface ChatRow {
   id: number;
   kind: string;
