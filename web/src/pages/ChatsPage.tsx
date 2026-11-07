@@ -1,6 +1,6 @@
 // Чаты в стиле Telegram: слева список диалогов, справа сам чат.
 // Новые сообщения приходят через Ably, без перезагрузки страницы.
-import { CSSProperties, FormEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { CSSProperties, FormEvent, ReactNode, RefObject, useEffect, useRef, useState } from "react";
 import { enablePush, disablePush } from "../push";
 import * as Ably from "ably";
 import { COMMITTEE_ROLES, User, downloadAttachment, loadAttachmentUrl, loadImage, request, uploadAttachment, uploadFile } from "../api";
@@ -518,6 +518,9 @@ function ChatView({
   const [messages, setMessages] = useState<Msg[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [text, setText] = useState("");
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const textRef = useRef<HTMLTextAreaElement>(null);
+  const pickerRef = useRef<HTMLDivElement>(null);
   const [editing, setEditing] = useState<Msg | null>(null);
   const [editText, setEditText] = useState("");
   const [deleting, setDeleting] = useState<number[] | null>(null);
@@ -631,6 +634,31 @@ function ChatView({
       .catch(() => undefined);
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [lastId]);
+
+  function insertEmoji(emoji: string) {
+    const el = textRef.current;
+    const start = el ? el.selectionStart : text.length;
+    const end = el ? el.selectionEnd : text.length;
+    setText(text.slice(0, start) + emoji + text.slice(end));
+    requestAnimationFrame(() => {
+      if (!el) return;
+      el.focus();
+      const pos = start + emoji.length;
+      el.setSelectionRange(pos, pos);
+    });
+  }
+
+  // Закрываем панель смайлов при клике вне её (кнопка смайлика переключает сама)
+  useEffect(() => {
+    if (!pickerOpen) return;
+    function onDown(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (pickerRef.current?.contains(target) || target.closest("[data-emoji-toggle]")) return;
+      setPickerOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [pickerOpen]);
 
   async function sendText() {
     const body = text.trim();
@@ -1022,12 +1050,14 @@ function ChatView({
               <button onClick={() => setReplyTo(null)} aria-label="Отменить ответ" style={linkStyle}>✕</button>
             </div>
           )}
+          <div style={{ position: "relative", marginTop: 8 }}>
+          {pickerOpen && <EmojiPicker pickerRef={pickerRef} onPick={insertEmoji} />}
           <form
             onSubmit={(e: FormEvent) => {
               e.preventDefault();
               sendText();
             }}
-            style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8, background: colors.navy, borderRadius: 24, padding: "4px 8px 4px 6px" }}
+            style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 0, background: colors.navy, borderRadius: 24, padding: "4px 8px 4px 6px" }}
           >
             <input
               ref={fileRef}
@@ -1042,6 +1072,7 @@ function ChatView({
               <ClipIcon />
             </button>
             <textarea
+              ref={textRef}
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
@@ -1065,21 +1096,26 @@ function ChatView({
                 maxHeight: 120,
               }}
             />
+            <button
+              type="button"
+              data-emoji-toggle
+              onClick={() => setPickerOpen((open) => !open)}
+              aria-label="Смайлики"
+              style={{ ...composerIconButton, color: pickerOpen ? colors.yellow : composerIconButton.color }}
+            >
+              <SmileIcon />
+            </button>
             {text.trim() ? (
               <button type="submit" disabled={busy} aria-label="Отправить" style={composerIconButton}>
                 <SendIcon />
               </button>
             ) : (
-              <>
-                <button type="button" disabled aria-label="Смайлики" style={composerIconButton}>
-                  <SmileIcon />
-                </button>
-                <button type="button" disabled aria-label="Голосовое сообщение" style={composerIconButton}>
-                  <MicIcon />
-                </button>
-              </>
+              <button type="button" disabled aria-label="Голосовое сообщение" style={composerIconButton}>
+                <MicIcon />
+              </button>
             )}
           </form>
+          </div>
         </>
       )}
     </div>
@@ -1144,6 +1180,48 @@ function ClipIcon() {
     <svg {...iconProps}>
       <path d="M21 11.5l-8.5 8.5a5 5 0 0 1-7-7l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 0 1-2.8-2.8l8.2-8.2" />
     </svg>
+  );
+}
+
+const EMOJI_SET = [
+  "😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣", "😊", "😇", "🙂", "😉", "😍", "🥰", "😘", "😋",
+  "😎", "🤩", "🥳", "😏", "😒", "😔", "😢", "😭", "😤", "😡", "🤔", "🤨", "😐", "😶", "😴", "🤒",
+  "👍", "👎", "👏", "🙌", "🙏", "💪", "🤝", "👌", "✌️", "🤞", "👋", "🫡", "❤️", "🧡", "💛", "💚",
+  "💙", "💜", "🔥", "⭐", "✨", "🎉", "🎂", "💯", "✅", "❌", "⚠️", "📌", "📎", "📷", "🎵", "🏆",
+];
+
+function EmojiPicker({ pickerRef, onPick }: { pickerRef: RefObject<HTMLDivElement | null>; onPick: (emoji: string) => void }) {
+  return (
+    <div
+      ref={pickerRef}
+      style={{
+        position: "absolute",
+        bottom: "calc(100% + 8px)",
+        left: 0,
+        width: 296,
+        maxWidth: "100%",
+        background: "#0b1420",
+        borderRadius: 16,
+        padding: 8,
+        boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+        display: "grid",
+        gridTemplateColumns: "repeat(8, 1fr)",
+        gap: 2,
+        zIndex: 20,
+      }}
+    >
+      {EMOJI_SET.map((emoji) => (
+        <button
+          key={emoji}
+          type="button"
+          onClick={() => onPick(emoji)}
+          aria-label={`Смайлик ${emoji}`}
+          style={{ background: "none", border: "none", fontSize: 22, padding: 4, cursor: "pointer", borderRadius: 8, lineHeight: 1 }}
+        >
+          {emoji}
+        </button>
+      ))}
+    </div>
   );
 }
 
