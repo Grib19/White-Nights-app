@@ -1520,8 +1520,9 @@ export default {
       }
 
       return json({ error: "Не найдено" }, 404);
-    } catch {
-      // Подробности ошибки не отдаём наружу
+    } catch (err) {
+      // Подробности не отдаём в ответе, но пишем в журнал Cloudflare (npx wrangler tail)
+      console.error("Ошибка", method, path, err instanceof Error ? `${err.name}: ${err.message}` : String(err));
       return json({ error: "Внутренняя ошибка сервера" }, 500);
     }
   },
