@@ -1209,8 +1209,10 @@ function EmojiPicker({ pickerRef, onPick }: { pickerRef: RefObject<HTMLDivElemen
         borderRadius: 16,
         padding: 8,
         boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+        boxSizing: "border-box",
         display: "grid",
-        gridTemplateColumns: "repeat(8, 1fr)",
+        // minmax(0, 1fr): столбцы сжимаются вместе с панелью и не выходят за её край
+        gridTemplateColumns: "repeat(8, minmax(0, 1fr))",
         gap: 2,
         zIndex: 50,
       }}
@@ -1221,7 +1223,7 @@ function EmojiPicker({ pickerRef, onPick }: { pickerRef: RefObject<HTMLDivElemen
           type="button"
           onClick={() => onPick(emoji)}
           aria-label={`Смайлик ${emoji}`}
-          style={{ background: "none", border: "none", fontSize: 22, padding: 4, cursor: "pointer", borderRadius: 8, lineHeight: 1 }}
+          style={{ background: "none", border: "none", width: "100%", boxSizing: "border-box", fontSize: 20, padding: 2, cursor: "pointer", borderRadius: 8, lineHeight: 1 }}
         >
           {emoji}
         </button>
