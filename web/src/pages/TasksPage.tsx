@@ -1,4 +1,4 @@
-import { CSSProperties, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, CSSProperties, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { COMMITTEE_ROLES, User, downloadAttachment, request, uploadAttachment } from "../api";
 import { button, card, colors, input, tabButton } from "../styles";
 
@@ -190,10 +190,16 @@ function Overlay({ children, onClose }: { children: ReactNode; onClose: () => vo
   );
 }
 
-function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: number) => void }) {
+function TaskCard({ task, onOpen, onChanged }: { task: Task; onOpen: (id: number) => void; onChanged: () => void }) {
   const done = task.status === "done";
   const overdue = isOverdue(task);
   const [showAllSubs, setShowAllSubs] = useState(false);
+  // Отметка пункта прямо из списка; нет прав — сервер ответит ошибкой, и ничего не меняется
+  async function toggleSub(e: ChangeEvent<HTMLInputElement>, id: number) {
+    e.stopPropagation();
+    const { status } = await request(`/api/subtasks/${id}`, "PUT", { done: e.target.checked });
+    if (status === 200) onChanged();
+  }
   // Пункты списком под задачей: важные выше, больше пяти — свёрнуты
   const subs = [...task.subtasks].sort((x, y) => y.importance - x.importance);
   const shownSubs = showAllSubs || subs.length <= 5 ? subs : subs.slice(0, 5);
@@ -221,6 +227,13 @@ function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: number) => void }
         <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${colors.gray}` }}>
           {shownSubs.map((sub) => (
             <div key={sub.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, marginBottom: 3 }}>
+              <input
+                type="checkbox"
+                checked={!!sub.done}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => toggleSub(e, sub.id)}
+                style={{ width: 16, height: 16, flexShrink: 0, cursor: "pointer" }}
+              />
               <span
                 style={{
                   flex: 1,
@@ -230,7 +243,7 @@ function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: number) => void }
                   textDecoration: sub.done ? "line-through" : "none",
                 }}
               >
-                {sub.done ? "☑" : "☐"} {sub.title}
+                {sub.title}
                 {sub.assignee_name && <span style={{ fontSize: 12, color: colors.gray }}> · {sub.assignee_name}</span>}
               </span>
               <Stars value={sub.importance} />
@@ -925,7 +938,7 @@ function RemindersEditor({ values, onChange }: { values: string[]; onChange: (v:
   );
 }
 
-function Calendar({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: number) => void }) {
+function Calendar({ tasks, onOpen, onChanged }: { tasks: Task[]; onOpen: (id: number) => void; onChanged: () => void }) {
   const [month, setMonth] = useState(() => {
     const d = new Date();
     return new Date(d.getFullYear(), d.getMonth(), 1);
@@ -998,7 +1011,7 @@ function Calendar({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: number) => vo
         <div style={{ marginTop: 14 }}>
           <div style={{ fontSize: 14, color: colors.blue, marginBottom: 6 }}>Вне этого месяца и без срока ({outside.length})</div>
           {outside.map((t) => (
-            <TaskCard key={t.id} task={t} onOpen={onOpen} />
+            <TaskCard key={t.id} task={t} onOpen={onOpen} onChanged={onChanged} />
           ))}
         </div>
       )}
@@ -1106,7 +1119,7 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
             <p style={{ color: colors.gray }}>{listTab === "open" ? "Невыполненных задач нет." : "Выполненных задач пока нет."}</p>
           )}
           {(listTab === "open" ? open : done).map((t) => (
-            <TaskCard key={t.id} task={t} onOpen={setOpenId} />
+            <TaskCard key={t.id} task={t} onOpen={setOpenId} onChanged={changed} />
           ))}
         </>
       )}
@@ -1122,14 +1135,14 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
                 {col.title} ({col.items.length})
               </div>
               {col.items.map((t) => (
-                <TaskCard key={t.id} task={t} onOpen={setOpenId} />
+                <TaskCard key={t.id} task={t} onOpen={setOpenId} onChanged={changed} />
               ))}
             </div>
           ))}
         </div>
       )}
 
-      {view === "calendar" && <Calendar tasks={shown} onOpen={setOpenId} />}
+      {view === "calendar" && <Calendar tasks={shown} onOpen={setOpenId} onChanged={changed} />}
 
       {current && (
         <TaskDetail
