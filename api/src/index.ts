@@ -935,7 +935,8 @@ async function toggleReaction(request: Request, env: Env): Promise<Response> {
   if (!EMOJIS.includes(emoji)) return json({ error: "Такой реакции нет" }, 400);
 
   const table = type === "post" ? "posts" : type === "comment" ? "comments" : "messages";
-  const exists = await env.DB.prepare(`SELECT id, chat_id FROM ${table} WHERE id = ?`)
+  // chat_id есть только у сообщений; у постов и комментариев такой колонки нет
+  const exists = await env.DB.prepare(`SELECT id${type === "message" ? ", chat_id" : ""} FROM ${table} WHERE id = ?`)
     .bind(id)
     .first<{ id: number; chat_id?: number }>();
   if (!exists) return json({ error: "Не найдено" }, 404);
