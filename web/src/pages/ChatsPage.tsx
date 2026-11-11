@@ -1065,17 +1065,17 @@ function ChatView({
                     ...(own ? { right: 6 } : { left: 6 }),
                     display: "flex",
                     alignItems: "center",
-                    background: colors.navy,
-                    borderRadius: 16,
-                    padding: 2,
-                    boxShadow: "0 2px 8px rgba(0,0,0,0.35)",
+                    background: "#F2D98A",
+                    borderRadius: 11,
+                    padding: 1,
+                    boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
                     zIndex: 5,
                   }}
                 >
                   <button type="button" onClick={() => setReplyTo(m)} aria-label="Ответить" style={hoverButton}>
                     <ReplyIcon />
                   </button>
-                  <span style={{ width: 1, height: 18, background: "rgba(255,255,255,0.2)" }} />
+                  <span style={{ width: 1, height: 12, background: "rgba(2,35,66,0.25)" }} />
                   <button
                     type="button"
                     onClick={(e) => {
@@ -1283,16 +1283,16 @@ function ChatView({
 const hoverButton: CSSProperties = {
   background: "none",
   border: "none",
-  padding: "6px 8px",
+  padding: "4px 6px",
   cursor: "pointer",
-  color: "#f5f5f5",
+  color: colors.navy,
   display: "flex",
   alignItems: "center",
 };
 
 function ReplyIcon() {
   return (
-    <svg {...iconProps} width={18} height={18}>
+    <svg {...iconProps} width={12} height={12}>
       <path d="M9 14L4 9l5-5" />
       <path d="M4 9h10a6 6 0 0 1 6 6v3" />
     </svg>
@@ -1301,7 +1301,7 @@ function ReplyIcon() {
 
 function DotsIcon() {
   return (
-    <svg width={18} height={18} viewBox="0 0 24 24" aria-hidden="true">
+    <svg width={12} height={12} viewBox="0 0 24 24" aria-hidden="true">
       <circle cx="6" cy="12" r="1.8" fill="currentColor" />
       <circle cx="12" cy="12" r="1.8" fill="currentColor" />
       <circle cx="18" cy="12" r="1.8" fill="currentColor" />
