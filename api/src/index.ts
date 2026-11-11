@@ -1864,9 +1864,10 @@ async function listTasks(request: Request, env: Env): Promise<Response> {
   const rows = (
     await env.DB.prepare(
       `${TASK_SELECT} WHERE t.creator_id = ? OR t.assignee_id = ? OR t.for_all = 1 OR (? = 1 AND t.assigned_by_committee = 1)
-       ORDER BY (status = 'done'), (t.due_date IS NULL), t.due_date, t.importance DESC, t.id DESC LIMIT ?`,
+       ORDER BY ((t.for_all = 1 AND EXISTS (SELECT 1 FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?)) OR (t.for_all = 0 AND t.status = 'done')),
+         (t.due_date IS NULL), t.due_date, t.importance DESC, t.id DESC LIMIT ?`,
     )
-      .bind(user.id, user.id, user.id, user.id, isCommittee(user) ? 1 : 0, TASK_LIMIT)
+      .bind(user.id, user.id, user.id, user.id, isCommittee(user) ? 1 : 0, user.id, TASK_LIMIT)
       .all<TaskRow>()
   ).results;
   const subs = (
