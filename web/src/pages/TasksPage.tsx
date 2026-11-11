@@ -283,7 +283,9 @@ function TaskDetail({
   const [err, setErr] = useState("");
   const isCreator = task.creator_id === viewer.id;
   const isAssignee = task.assignee_id === viewer.id;
-  const canEditSub = isCreator || isAssignee;
+  // Выполненную задачу нельзя редактировать (у «Весь отряд» — когда выполнили все)
+  const locked = task.for_all === 1 ? task.members_total > 0 && task.done_count >= task.members_total : task.status === "done";
+  const canEditSub = (isCreator || isAssignee) && !locked;
 
   async function loadComments() {
     const { status, data } = await request(`/api/tasks/${task.id}/comments`);
@@ -359,6 +361,7 @@ function TaskDetail({
         <h3 style={{ margin: 0, overflowWrap: "anywhere", textDecoration: task.status === "done" ? "line-through" : "none" }}>{task.title}</h3>
         <button type="button" onClick={onClose} aria-label="Закрыть" style={linkButton}>✕</button>
       </div>
+      {locked && <div style={{ marginTop: 6, fontSize: 13, color: colors.yellow }}>Задача выполнена, редактирование закрыто.</div>}
       {task.edited_at && (
         <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 13 }}>
           <span style={{ background: colors.yellow, color: colors.navy, borderRadius: 999, padding: "1px 8px", fontWeight: "bold" }}>Редактировано</span>
@@ -395,7 +398,7 @@ function TaskDetail({
         </button>
       )}
 
-      {(isAssignee || isCreator) && (
+      {(isAssignee || isCreator) && !locked && (
         <div style={{ marginTop: 12 }}>
           <RemindersEditor values={reminders} onChange={setReminders} />
           <button type="button" style={{ ...button, width: "auto", padding: "8px 14px", fontSize: 14 }} onClick={saveReminders}>
@@ -412,9 +415,11 @@ function TaskDetail({
         )}
         {isCreator && (
           <>
-            <button type="button" style={{ ...tabButton(false), padding: "8px 14px" }} onClick={onEdit}>
-              Редактировать
-            </button>
+            {!locked && (
+              <button type="button" style={{ ...tabButton(false), padding: "8px 14px" }} onClick={onEdit}>
+                Редактировать
+              </button>
+            )}
             <button type="button" style={{ ...tabButton(false), padding: "8px 14px", color: "#b00020" }} onClick={remove}>
               Удалить
             </button>

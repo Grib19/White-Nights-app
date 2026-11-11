@@ -1692,6 +1692,12 @@ function canSeeTask(user: UserRow, t: { creator_id: number; assignee_id: number;
 }
 
 // Менять подпункты и закрывать задачу могут только создатель и исполнитель
+// Выполненную задачу нельзя редактировать: обычную — когда отмечена, у «Весь отряд» — когда выполнили все
+function isLocked(t: TaskRow): boolean {
+  if (t.for_all === 1) return t.members_total > 0 && t.done_count >= t.members_total;
+  return t.status === "done";
+}
+
 function isTaskParty(user: UserRow, t: { creator_id: number; assignee_id: number }): boolean {
   return t.creator_id === user.id || t.assignee_id === user.id;
 }
@@ -1954,6 +1960,7 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
   const isCreator = task.creator_id === user.id;
   if (!isCreator && task.assignee_id !== user.id) return json({ error: "Нет доступа" }, 403);
+  if (isLocked(task)) return json({ error: "Выполненную задачу нельзя редактировать" }, 403);
   const body = await readJson(request);
 
   let title = task.title;
@@ -2145,6 +2152,7 @@ async function addSubtask(request: Request, env: Env, taskId: number): Promise<R
   if (!user) return json({ error: "Нужен вход" }, 401);
   const task = await taskById(env, taskId, user.id);
   if (!task || !canSeeTask(user, task) || !isTaskParty(user, task)) return json({ error: "Не найдено" }, 404);
+  if (isLocked(task)) return json({ error: "Выполненную задачу нельзя редактировать" }, 403);
   const body = await readJson(request);
   const title = str(body.title, TASK_SUBTASK_MAX);
   if (!title) return json({ error: "Напишите пункт" }, 400);
@@ -2157,14 +2165,14 @@ async function addSubtask(request: Request, env: Env, taskId: number): Promise<R
   return json({ task: await loadTaskOut(env, taskId, user.id) }, 201);
 }
 
-async function subtaskParent(env: Env, user: UserRow, subId: number): Promise<{ taskId: number } | null> {
+async function subtaskParent(env: Env, user: UserRow, subId: number): Promise<{ taskId: number; task: TaskRow } | null> {
   const sub = await env.DB.prepare("SELECT task_id FROM task_subtasks WHERE id = ?")
     .bind(subId)
     .first<{ task_id: number }>();
   if (!sub) return null;
   const task = await taskById(env, sub.task_id, user.id);
   if (!task || !canSeeTask(user, task) || !isTaskParty(user, task)) return null;
-  return { taskId: sub.task_id };
+  return { taskId: sub.task_id, task };
 }
 
 async function updateSubtask(request: Request, env: Env, subId: number): Promise<Response> {
@@ -2172,6 +2180,7 @@ async function updateSubtask(request: Request, env: Env, subId: number): Promise
   if (!user) return json({ error: "Нужен вход" }, 401);
   const parent = await subtaskParent(env, user, subId);
   if (!parent) return json({ error: "Не найдено" }, 404);
+  if (isLocked(parent.task)) return json({ error: "Выполненную задачу нельзя редактировать" }, 403);
   const body = await readJson(request);
   if (body.title !== undefined) {
     const title = str(body.title, TASK_SUBTASK_MAX);
@@ -2193,6 +2202,7 @@ async function deleteSubtask(request: Request, env: Env, subId: number): Promise
   if (!user) return json({ error: "Нужен вход" }, 401);
   const parent = await subtaskParent(env, user, subId);
   if (!parent) return json({ error: "Не найдено" }, 404);
+  if (isLocked(parent.task)) return json({ error: "Выполненную задачу нельзя редактировать" }, 403);
   const prev = await env.DB.prepare("SELECT title FROM task_subtasks WHERE id = ?").bind(subId).first<{ title: string }>();
   await env.DB.prepare("DELETE FROM task_subtasks WHERE id = ?").bind(subId).run();
   if (prev) await recordHistory(env, parent.taskId, user.id, [{ f: "subtask_remove", from: prev.title, to: null }]);
