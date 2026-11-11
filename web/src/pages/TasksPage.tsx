@@ -190,7 +190,97 @@ function Overlay({ children, onClose }: { children: ReactNode; onClose: () => vo
   );
 }
 
-function TaskCard({ task, onOpen, onChanged }: { task: Task; onOpen: (id: number) => void; onChanged: () => void }) {
+type SortField = "due" | "importance" | "title" | "created";
+interface SortLevel {
+  field: SortField;
+  dir: "asc" | "desc";
+}
+const SORT_LABELS: Record<SortField, string> = { due: "Срок", importance: "Важность", title: "Название", created: "Дата создания" };
+
+// Сравнение по нескольким уровням сразу: сначала первый, при равенстве — следующий. Пустые значения всегда внизу
+function compareBy<T>(levels: SortLevel[], get: (item: T, field: SortField) => string | number | null): (a: T, b: T) => number {
+  return (a, b) => {
+    for (const lv of levels) {
+      const va = get(a, lv.field);
+      const vb = get(b, lv.field);
+      if (va === vb) continue;
+      if (va === null || va === undefined) return 1;
+      if (vb === null || vb === undefined) return -1;
+      const r = typeof va === "number" && typeof vb === "number" ? va - vb : String(va).localeCompare(String(vb), "ru");
+      if (r !== 0) return lv.dir === "asc" ? r : -r;
+    }
+    return 0;
+  };
+}
+
+const taskSortValue = (t: Task, f: SortField): string | number | null =>
+  f === "due" ? t.due_date : f === "importance" ? t.importance : f === "title" ? t.title : t.created_at;
+
+// У подпункта нет срока; дата создания — порядок добавления (id растёт)
+const subSortValue = (s: { id: number; title: string; importance: number }, f: SortField): string | number | null =>
+  f === "importance" ? s.importance : f === "title" ? s.title : f === "created" ? s.id : null;
+
+function SortBar({ levels, onChange }: { levels: SortLevel[]; onChange: (l: SortLevel[]) => void }) {
+  function update(i: number, patch: Partial<SortLevel>) {
+    onChange(levels.map((l, j) => (j === i ? { ...l, ...patch } : l)));
+  }
+  if (levels.length === 0) {
+    return (
+      <div style={{ marginBottom: 10 }}>
+        <button type="button" onClick={() => onChange([{ field: "due", dir: "asc" }])} style={{ ...tabButton(false), padding: "6px 12px" }}>
+          Сортировка
+        </button>
+      </div>
+    );
+  }
+  const nextField = (Object.keys(SORT_LABELS) as SortField[]).find((f) => !levels.some((l) => l.field === f)) ?? "due";
+  return (
+    <div style={{ ...card, padding: 10, marginBottom: 12 }}>
+      {levels.map((lv, i) => (
+        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 13, color: colors.gray, minWidth: 56 }}>{i === 0 ? "Сначала" : "Затем"}</span>
+          <select style={{ ...input, width: "auto", margin: 0 }} value={lv.field} onChange={(e) => update(i, { field: e.target.value as SortField })}>
+            {(Object.keys(SORT_LABELS) as SortField[])
+              .filter((f) => f === lv.field || !levels.some((l) => l.field === f))
+              .map((f) => (
+                <option key={f} value={f}>
+                  {SORT_LABELS[f]}
+                </option>
+              ))}
+          </select>
+          <button type="button" onClick={() => update(i, { dir: lv.dir === "asc" ? "desc" : "asc" })} style={{ ...tabButton(false), padding: "6px 12px" }}>
+            {lv.dir === "asc" ? "↑ по возрастанию" : "↓ по убыванию"}
+          </button>
+          <button type="button" onClick={() => onChange(levels.filter((_, j) => j !== i))} style={linkButton}>
+            убрать
+          </button>
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        {levels.length < 4 && (
+          <button type="button" onClick={() => onChange([...levels, { field: nextField, dir: "asc" }])} style={linkButton}>
+            + Добавить уровень
+          </button>
+        )}
+        <button type="button" onClick={() => onChange([])} style={linkButton}>
+          Сбросить сортировку
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TaskCard({
+  task,
+  onOpen,
+  onChanged,
+  sortLevels = [],
+}: {
+  task: Task;
+  onOpen: (id: number) => void;
+  onChanged: () => void;
+  sortLevels?: SortLevel[];
+}) {
   const done = task.status === "done";
   const overdue = isOverdue(task);
   const [showAllSubs, setShowAllSubs] = useState(false);
@@ -201,7 +291,10 @@ function TaskCard({ task, onOpen, onChanged }: { task: Task; onOpen: (id: number
     if (status === 200) onChanged();
   }
   // Пункты списком под задачей: важные выше, больше пяти — свёрнуты
-  const subs = [...task.subtasks].sort((x, y) => y.importance - x.importance);
+  // Без сортировки списка — пункты по важности, как раньше
+  const subs = [...task.subtasks].sort(
+    compareBy(sortLevels.length ? sortLevels : [{ field: "importance", dir: "desc" }], subSortValue),
+  );
   const shownSubs = showAllSubs || subs.length <= 5 ? subs : subs.slice(0, 5);
   return (
     <div
@@ -1025,6 +1118,7 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
   const [scope, setScope] = useState<Scope>("mine");
   const [view, setView] = useState<View>("list");
   const [listTab, setListTab] = useState<"open" | "done">("open");
+  const [sortLevels, setSortLevels] = useState<SortLevel[]>([]);
   const [openId, setOpenId] = useState<number | null>(null);
   const [editing, setEditing] = useState<Task | null>(null);
   const [creating, setCreating] = useState(false);
@@ -1069,6 +1163,8 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
   const current = openId !== null ? tasks.find((t) => t.id === openId) ?? null : null;
   const open = shown.filter((t) => t.status !== "done");
   const done = shown.filter((t) => t.status === "done");
+  const sortedOpen = useMemo(() => [...open].sort(compareBy(sortLevels, taskSortValue)), [open, sortLevels]);
+  const sortedDone = useMemo(() => [...done].sort(compareBy(sortLevels, taskSortValue)), [done, sortLevels]);
 
   return (
     <section>
@@ -1098,6 +1194,7 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
 
       {view === "list" && (
         <>
+          <SortBar levels={sortLevels} onChange={setSortLevels} />
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
             {(
               [
@@ -1115,11 +1212,11 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
               </button>
             ))}
           </div>
-          {(listTab === "open" ? open : done).length === 0 && (
+          {(listTab === "open" ? sortedOpen : sortedDone).length === 0 && (
             <p style={{ color: colors.gray }}>{listTab === "open" ? "Невыполненных задач нет." : "Выполненных задач пока нет."}</p>
           )}
-          {(listTab === "open" ? open : done).map((t) => (
-            <TaskCard key={t.id} task={t} onOpen={setOpenId} onChanged={changed} />
+          {(listTab === "open" ? sortedOpen : sortedDone).map((t) => (
+            <TaskCard key={t.id} task={t} onOpen={setOpenId} onChanged={changed} sortLevels={sortLevels} />
           ))}
         </>
       )}
