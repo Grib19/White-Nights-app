@@ -235,7 +235,11 @@ export function ChatsPage({ viewer }: { viewer: User }) {
           {shownChats.map((c) => (
             <button
               key={c.id}
-              onClick={() => setActiveId(c.id)}
+              onClick={() => {
+                // Выбор чата закрывает панель «Новый чат», иначе она перекрывает список
+                setShowNew(false);
+                setActiveId(c.id);
+              }}
               style={{
                 display: "flex",
                 justifyContent: "space-between",
@@ -1200,14 +1204,15 @@ function EmojiPicker({ pickerRef, onPick }: { pickerRef: RefObject<HTMLDivElemen
         left: 0,
         width: 296,
         maxWidth: "100%",
-        background: "#0b1420",
+        background: colors.navy,
+        border: `1px solid ${colors.blue}`,
         borderRadius: 16,
         padding: 8,
-        boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+        boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
         display: "grid",
         gridTemplateColumns: "repeat(8, 1fr)",
         gap: 2,
-        zIndex: 20,
+        zIndex: 50,
       }}
     >
       {EMOJI_SET.map((emoji) => (

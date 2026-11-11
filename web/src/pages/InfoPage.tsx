@@ -208,10 +208,11 @@ function SongCard({
   async function play() {
     setLoading(true);
     setError("");
-    const url = await loadAudio(song.id);
+    // Сетевой сбой не должен оставлять кнопку в состоянии «Загрузка…»
+    const url = await loadAudio(song.id).catch(() => null);
     setLoading(false);
     if (url) setSrc(url);
-    else setError("Не удалось загрузить запись");
+    else setError("Не удалось загрузить запись. Проверьте интернет и попробуйте ещё раз.");
   }
 
   return (

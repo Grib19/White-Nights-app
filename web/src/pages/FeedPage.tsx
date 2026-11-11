@@ -59,6 +59,15 @@ interface Comment {
 // Эмодзи для реакций: одна реакция от участника на пост или комментарий
 const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🔥", "👏", "🙏"];
 
+// Поля опроса: тёмно-синий фон с белым текстом, чтобы текст был виден
+const pollField: CSSProperties = {
+  ...input,
+  background: colors.navy,
+  color: colors.white,
+  border: `1px solid ${colors.blue}`,
+  colorScheme: "dark",
+};
+
 const MAX_OPTIONS = 10;
 
 // Лента новостей: посты с текстом, фото, файлом и опросом. Удалить может автор или комсостав.
@@ -236,11 +245,11 @@ export function FeedPage({ viewer }: { viewer: User }) {
           <div style={{ background: colors.field, borderRadius: 12, padding: 12, marginBottom: 12 }}>
             <label style={{ display: "block" }}>
               Тема вопроса
-              <input style={input} value={question} onChange={(e) => setQuestion(e.target.value)} maxLength={300} />
+              <input style={pollField} value={question} onChange={(e) => setQuestion(e.target.value)} maxLength={300} />
             </label>
             {options.map((o, i) => (
               <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <input style={input} placeholder={`Вариант ${i + 1}`} value={o} onChange={(e) => setOption(i, e.target.value)} maxLength={200} />
+                <input style={pollField} placeholder={`Вариант ${i + 1}`} value={o} onChange={(e) => setOption(i, e.target.value)} maxLength={200} />
                 {options.length > 2 && (
                   <button type="button" onClick={() => setOptions((list) => list.filter((_, j) => j !== i))} style={linkButton}>
                     убрать
@@ -268,7 +277,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
             {timed && (
               <label style={{ display: "block", marginTop: 6 }}>
                 Голосование до
-                <input style={input} type="datetime-local" value={endsAt} onChange={(e) => setEndsAt(e.target.value)} />
+                <input style={pollField} type="datetime-local" value={endsAt} onChange={(e) => setEndsAt(e.target.value)} />
               </label>
             )}
           </div>
@@ -296,6 +305,7 @@ export function FeedPage({ viewer }: { viewer: User }) {
 
 function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDelete: boolean; onDelete: () => void; onChanged: () => void }) {
   const [showComments, setShowComments] = useState(false);
+  const [reactError, setReactError] = useState("");
   const text = post.body ? <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.5, marginTop: 8 }}>{post.body}</div> : null;
   const media = (
     <>
@@ -325,10 +335,13 @@ function PostCard({ post, canDelete, onDelete, onChanged }: { post: Post; canDel
       <ReactionBar
         reactions={post.reactions}
         onPick={async (emoji) => {
-          await request("/api/reactions", "POST", { target_type: "post", target_id: post.id, emoji });
+          // Смена реакции: сервер заменяет прежнюю реакцию, повторный клик по той же — снимает её
+          const { status, data } = await request("/api/reactions", "POST", { target_type: "post", target_id: post.id, emoji });
+          setReactError(status === 200 ? "" : data.error ?? "Не удалось поставить реакцию");
           onChanged();
         }}
       />
+      {reactError && <div style={{ color: "#ff8a8a", fontSize: 13, marginTop: 4 }}>{reactError}</div>}
       <div style={{ marginTop: 8, display: "flex", gap: 14, alignItems: "center" }}>
         <button
           type="button"
