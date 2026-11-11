@@ -22,6 +22,9 @@ export interface Task {
   created_at: string;
   edited_at: string | null;
   comments_count: number;
+  for_all: number;
+  done_count: number;
+  members_total: number;
   reminders: string[];
   subtasks: { id: number; title: string; done: number }[];
 }
@@ -194,7 +197,8 @@ function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: number) => void }
         <Stars value={task.importance} />
       </div>
       <div style={{ fontSize: 13, color: colors.blue, marginTop: 4 }}>
-        Исполнитель: {task.assignee_name} · Автор: {task.creator_name}
+        Исполнитель: {task.for_all === 1 ? "Весь отряд" : task.assignee_name} · Автор: {task.creator_name}
+        {task.for_all === 1 ? ` · выполнили ${task.done_count} из ${task.members_total}` : ""}
       </div>
       <div style={{ fontSize: 13, marginTop: 4, color: overdue ? "#ff8a8a" : colors.blue }}>
         {task.due_date ? `Срок: ${formatDate(task.due_date)}${overdue ? " · просрочено" : ""}` : "Без срока"}
@@ -365,7 +369,12 @@ function TaskDetail({
       )}
       <div style={{ marginTop: 8, fontSize: 14, color: colors.blue }}>
         <Stars value={task.importance} />
-        <div style={{ marginTop: 6 }}>Исполнитель: {task.assignee_name}</div>
+        <div style={{ marginTop: 6 }}>Исполнитель: {task.for_all === 1 ? "Весь отряд" : task.assignee_name}</div>
+        {task.for_all === 1 && isCreator && (
+          <div>
+            Выполнили: {task.done_count} из {task.members_total}
+          </div>
+        )}
         <div>Автор: {task.creator_name}</div>
         <div style={{ color: isOverdue(task) ? "#ff8a8a" : colors.blue }}>
           Срок: {task.due_date ? formatDate(task.due_date) : "не задан"}
@@ -396,7 +405,7 @@ function TaskDetail({
       )}
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
-        {(isAssignee || isCreator) && (
+        {(isAssignee || isCreator || task.for_all === 1) && (
           <button type="button" style={{ ...button, width: "auto", padding: "8px 14px", fontSize: 14 }} onClick={() => setDone(task.status !== "done")}>
             {task.status === "done" ? "Вернуть в работу" : "Отметить выполненной"}
           </button>
@@ -479,7 +488,7 @@ function TaskForm({
   const [description, setDescription] = useState(initial?.description ?? "");
   const [dueDate, setDueDate] = useState(initial?.due_date ?? "");
   const [importance, setImportance] = useState(initial?.importance ?? 3);
-  const [assigneeId, setAssigneeId] = useState(initial?.assignee_id ?? viewer.id);
+  const [assignee, setAssignee] = useState<string>(initial ? (initial.for_all === 1 ? "all" : String(initial.assignee_id)) : String(viewer.id));
   const [reminders, setReminders] = useState<string[]>(initial ? initial.reminders.map((r) => toLocalInput(r)) : []);
   // undefined — файл не трогали; null — файл убрали; строка — новый файл
   const [attachmentId, setAttachmentId] = useState<string | null | undefined>(undefined);
@@ -527,7 +536,7 @@ function TaskForm({
       importance,
       reminders: newReminders,
     };
-    if (committee) payload.assignee_id = assigneeId;
+    if (committee) payload.assignee_id = assignee === "all" ? "all" : Number(assignee);
     if (attachmentId !== undefined) payload.attachment_id = attachmentId ?? "";
     setBusy(true);
     setErr("");
@@ -568,20 +577,26 @@ function TaskForm({
         <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
           Важность <Stars value={importance} onChange={setImportance} />
         </div>
-        {committee ? (
-          <label style={{ display: "block" }}>
-            Исполнитель
-            <select style={input} value={assigneeId} onChange={(e) => setAssigneeId(Number(e.target.value))}>
-              {members.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.full_name}
-                </option>
-              ))}
-            </select>
-          </label>
-        ) : (
-          <div style={{ fontSize: 14, color: colors.blue, marginBottom: 12 }}>Исполнитель: вы</div>
-        )}
+        <label style={{ display: "block" }}>
+          Исполнитель
+          <select
+            style={input}
+            value={committee ? assignee : String(viewer.id)}
+            onChange={(e) => setAssignee(e.target.value)}
+            disabled={!committee}
+          >
+            <option value={String(viewer.id)}>Я</option>
+            {committee && <option value="all">Весь отряд</option>}
+            {committee &&
+              members
+                .filter((m) => m.id !== viewer.id)
+                .map((m) => (
+                  <option key={m.id} value={String(m.id)}>
+                    {m.full_name}
+                  </option>
+                ))}
+          </select>
+        </label>
         <RemindersEditor values={reminders} onChange={setReminders} />
         <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <input
@@ -739,6 +754,7 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
   const [members, setMembers] = useState<Member[]>([]);
   const [scope, setScope] = useState<Scope>("mine");
   const [view, setView] = useState<View>("list");
+  const [listTab, setListTab] = useState<"open" | "done">("open");
   const [openId, setOpenId] = useState<number | null>(null);
   const [editing, setEditing] = useState<Task | null>(null);
   const [creating, setCreating] = useState(false);
@@ -773,7 +789,7 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
   }
 
   const shown = useMemo(() => {
-    if (scope === "mine") return tasks.filter((t) => t.assignee_id === viewer.id);
+    if (scope === "mine") return tasks.filter((t) => t.assignee_id === viewer.id || t.for_all === 1);
     if (scope === "assigned") return tasks.filter((t) => t.creator_id === viewer.id);
     return tasks;
   }, [tasks, scope, viewer.id]);
@@ -810,19 +826,29 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
 
       {view === "list" && (
         <>
-          <h4 style={{ margin: "0 0 8px", color: colors.blue }}>Открытые ({open.length})</h4>
-          {open.length === 0 && <p style={{ color: colors.gray }}>Открытых задач нет.</p>}
-          {open.map((t) => (
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+            {(
+              [
+                ["open", `Не выполнено (${open.length})`],
+                ["done", `Выполнено (${done.length})`],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setListTab(key)}
+                style={{ ...tabButton(listTab === key), background: listTab === key ? colors.yellow : "transparent", color: listTab === key ? colors.navy : colors.blue, border: `1px solid ${colors.blue}` }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {(listTab === "open" ? open : done).length === 0 && (
+            <p style={{ color: colors.gray }}>{listTab === "open" ? "Невыполненных задач нет." : "Выполненных задач пока нет."}</p>
+          )}
+          {(listTab === "open" ? open : done).map((t) => (
             <TaskCard key={t.id} task={t} onOpen={setOpenId} />
           ))}
-          {done.length > 0 && (
-            <>
-              <h4 style={{ margin: "16px 0 8px", color: colors.blue }}>Выполненные ({done.length})</h4>
-              {done.map((t) => (
-                <TaskCard key={t.id} task={t} onOpen={setOpenId} />
-              ))}
-            </>
-          )}
         </>
       )}
 

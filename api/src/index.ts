@@ -1661,6 +1661,9 @@ interface TaskRow {
   edited_at: string | null;
   comments_count: number;
   reminders_raw: string | null;
+  for_all: number;
+  done_count: number;
+  members_total: number;
 }
 
 interface SubtaskRow {
@@ -1672,13 +1675,19 @@ interface SubtaskRow {
 
 const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importance, t.creator_id, cu.full_name AS creator_name,
   t.assignee_id, au.full_name AS assignee_name, t.assigned_by_committee, t.attachment_id, t.attachment_name,
-  t.status, t.done_at, t.created_at, t.edited_at,
+  t.for_all,
+  CASE WHEN t.for_all = 1 THEN (CASE WHEN EXISTS (SELECT 1 FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?) THEN 'done' ELSE 'open' END) ELSE t.status END AS status,
+  CASE WHEN t.for_all = 1 THEN (SELECT d.done_at FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?) ELSE t.done_at END AS done_at,
+  t.created_at, t.edited_at,
   (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS comments_count,
+  (SELECT COUNT(*) FROM task_done d WHERE d.task_id = t.id) AS done_count,
+  (SELECT COUNT(*) FROM users WHERE status = 'approved') AS members_total,
   (SELECT group_concat(r.remind_at, '|') FROM task_reminders r WHERE r.task_id = t.id) AS reminders_raw
   FROM tasks t JOIN users cu ON cu.id = t.creator_id JOIN users au ON au.id = t.assignee_id`;
 
 // Задачу видят: её создатель и исполнитель, а также весь комсостав — если задачу назначил комсостав
-function canSeeTask(user: UserRow, t: { creator_id: number; assignee_id: number; assigned_by_committee: number }): boolean {
+function canSeeTask(user: UserRow, t: { creator_id: number; assignee_id: number; assigned_by_committee: number; for_all?: number }): boolean {
+  if (t.for_all === 1) return true;
   return t.creator_id === user.id || t.assignee_id === user.id || (isCommittee(user) && t.assigned_by_committee === 1);
 }
 
@@ -1687,8 +1696,8 @@ function isTaskParty(user: UserRow, t: { creator_id: number; assignee_id: number
   return t.creator_id === user.id || t.assignee_id === user.id;
 }
 
-async function taskById(env: Env, id: number): Promise<TaskRow | null> {
-  return env.DB.prepare(`${TASK_SELECT} WHERE t.id = ?`).bind(id).first<TaskRow>();
+async function taskById(env: Env, id: number, viewerId: number): Promise<TaskRow | null> {
+  return env.DB.prepare(`${TASK_SELECT} WHERE t.id = ?`).bind(viewerId, viewerId, id).first<TaskRow>();
 }
 
 function shapeTask(row: TaskRow, subtasks: SubtaskRow[]) {
@@ -1701,8 +1710,8 @@ function shapeTask(row: TaskRow, subtasks: SubtaskRow[]) {
   };
 }
 
-async function loadTaskOut(env: Env, id: number) {
-  const row = await taskById(env, id);
+async function loadTaskOut(env: Env, id: number, viewerId: number) {
+  const row = await taskById(env, id, viewerId);
   if (!row) return null;
   const subs = (
     await env.DB.prepare("SELECT id, title, done FROM task_subtasks WHERE task_id = ? ORDER BY position, id")
@@ -1769,19 +1778,39 @@ async function notifyUsers(env: Env, userIds: number[]): Promise<void> {
 }
 
 // Вызывается по расписанию: шлёт напоминания, у которых подошло время
+async function notifyAllApproved(env: Env, exceptId: number): Promise<void> {
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return;
+  const rows = (
+    await env.DB.prepare(
+      "SELECT s.id, s.endpoint FROM push_subscriptions s JOIN users u ON u.id = s.user_id WHERE u.status = 'approved' AND s.user_id <> ? LIMIT ?",
+    )
+      .bind(exceptId, PUSH_MAX_SENDS)
+      .all<{ id: number; endpoint: string }>()
+  ).results;
+  await Promise.allSettled(rows.map((r) => sendPush(env, r, API_ORIGIN)));
+}
+
+// Вызывается по расписанию: шлёт напоминания, у которых подошло время
 async function sendDueReminders(env: Env): Promise<void> {
   const due = (
     await env.DB.prepare(
-      `SELECT r.id, t.assignee_id, t.status FROM task_reminders r JOIN tasks t ON t.id = r.task_id
+      `SELECT r.id, t.assignee_id, t.status, t.for_all FROM task_reminders r JOIN tasks t ON t.id = r.task_id
        WHERE r.sent = 0 AND r.remind_at <= ? ORDER BY r.remind_at LIMIT ?`,
     )
       .bind(new Date().toISOString(), REMIND_BATCH)
-      .all<{ id: number; assignee_id: number; status: string }>()
+      .all<{ id: number; assignee_id: number; status: string; for_all: number }>()
   ).results;
+  let allSent = false;
   for (const r of due) {
+    // Рассылка всему отряду занимает много запросов: одну такую за минуту, остальное в следующую
+    if (r.for_all === 1) {
+      if (allSent) break;
+      allSent = true;
+    }
     // Сначала отмечаем, чтобы при сбое напоминание не ушло дважды
     await env.DB.prepare("UPDATE task_reminders SET sent = 1 WHERE id = ?").bind(r.id).run();
-    if (r.status === "open") await notifyUsers(env, [r.assignee_id]);
+    if (r.for_all === 1) await notifyAllApproved(env, 0);
+    else if (r.status === "open") await notifyUsers(env, [r.assignee_id]);
   }
 }
 
@@ -1834,10 +1863,10 @@ async function listTasks(request: Request, env: Env): Promise<Response> {
   if (!user) return json({ error: "Нужен вход" }, 401);
   const rows = (
     await env.DB.prepare(
-      `${TASK_SELECT} WHERE t.creator_id = ? OR t.assignee_id = ? OR (? = 1 AND t.assigned_by_committee = 1)
-       ORDER BY (t.status = 'done'), (t.due_date IS NULL), t.due_date, t.importance DESC, t.id DESC LIMIT ?`,
+      `${TASK_SELECT} WHERE t.creator_id = ? OR t.assignee_id = ? OR t.for_all = 1 OR (? = 1 AND t.assigned_by_committee = 1)
+       ORDER BY (status = 'done'), (t.due_date IS NULL), t.due_date, t.importance DESC, t.id DESC LIMIT ?`,
     )
-      .bind(user.id, user.id, isCommittee(user) ? 1 : 0, TASK_LIMIT)
+      .bind(user.id, user.id, user.id, user.id, isCommittee(user) ? 1 : 0, TASK_LIMIT)
       .all<TaskRow>()
   ).results;
   const subs = (
@@ -1853,9 +1882,10 @@ async function taskBadge(request: Request, env: Env): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
   const row = await env.DB.prepare(
-    "SELECT COUNT(*) AS open FROM tasks WHERE assignee_id = ? AND status = 'open'",
+    `SELECT COUNT(*) AS open FROM tasks t WHERE (t.for_all = 0 AND t.assignee_id = ? AND t.status = 'open')
+       OR (t.for_all = 1 AND NOT EXISTS (SELECT 1 FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?))`,
   )
-    .bind(user.id)
+    .bind(user.id, user.id)
     .first<{ open: number }>();
   return json({ open: row?.open ?? 0 });
 }
@@ -1866,9 +1896,11 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const title = str(body.title, TASK_TITLE_MAX);
   if (!title) return json({ error: "Укажите название задачи" }, 400);
-  const assigneeId = body.assignee_id === undefined ? user.id : Number(body.assignee_id);
+  const forAll = body.assignee_id === "all";
+  if (forAll && !isCommittee(user)) return json({ error: "Задачу всему отряду ставит комсостав" }, 403);
+  const assigneeId = forAll || body.assignee_id === undefined ? user.id : Number(body.assignee_id);
   if (!Number.isInteger(assigneeId) || assigneeId <= 0) return json({ error: "Неверный исполнитель" }, 400);
-  if (assigneeId !== user.id && !isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
+  if (!forAll && assigneeId !== user.id && !isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
   const assignee = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'")
     .bind(assigneeId)
     .first<{ id: number }>();
@@ -1887,11 +1919,11 @@ async function createTask(request: Request, env: Env): Promise<Response> {
     attName = await attachmentName(env, attachmentId);
     if (!attName) return json({ error: "Файл не найден" }, 400);
   }
-  const assignedByCommittee = isCommittee(user) && assigneeId !== user.id ? 1 : 0;
+  const assignedByCommittee = isCommittee(user) && (forAll || assigneeId !== user.id) ? 1 : 0;
   const result = await env.DB.prepare(
     `INSERT INTO tasks (title, description, due_date, importance, creator_id, assignee_id, assigned_by_committee,
-       attachment_id, attachment_name)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       attachment_id, attachment_name, for_all)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       title,
@@ -1903,19 +1935,21 @@ async function createTask(request: Request, env: Env): Promise<Response> {
       assignedByCommittee,
       attachmentId,
       attName,
+      forAll ? 1 : 0,
     )
     .run();
   const id = Number(result.meta.last_row_id);
   await replaceReminders(env, id, reminders);
-  if (assigneeId !== user.id) await notifyUsers(env, [assigneeId]);
-  return json({ task: await loadTaskOut(env, id) }, 201);
+  if (forAll) await notifyAllApproved(env, user.id);
+  else if (assigneeId !== user.id) await notifyUsers(env, [assigneeId]);
+  return json({ task: await loadTaskOut(env, id, user.id) }, 201);
 }
 
 // Создатель меняет всё, исполнитель — только напоминания
 async function updateTask(request: Request, env: Env, id: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const task = await taskById(env, id);
+  const task = await taskById(env, id, user.id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
   const isCreator = task.creator_id === user.id;
   if (!isCreator && task.assignee_id !== user.id) return json({ error: "Нет доступа" }, 403);
@@ -1942,12 +1976,16 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
       }
     }
     if (body.importance !== undefined) importance = cleanImportance(body.importance, importance);
-    if (body.assignee_id !== undefined && Number(body.assignee_id) !== task.assignee_id) {
-      if (!isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
+    if (body.assignee_id !== undefined) {
+      const wantAll = body.assignee_id === "all";
+      if (wantAll !== (task.for_all === 1)) return json({ error: "Тип исполнителя менять нельзя" }, 400);
       const nid = Number(body.assignee_id);
-      const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'").bind(nid).first();
-      if (!Number.isInteger(nid) || nid <= 0 || !exists) return json({ error: "Исполнитель не найден" }, 400);
-      assigneeId = nid;
+      if (!wantAll && nid !== task.assignee_id) {
+        if (!isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
+        const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'").bind(nid).first();
+        if (!Number.isInteger(nid) || nid <= 0 || !exists) return json({ error: "Исполнитель не найден" }, 400);
+        assigneeId = nid;
+      }
     }
     if (body.attachment_id !== undefined) {
       attachmentId = str(body.attachment_id, 64) || null;
@@ -1975,7 +2013,7 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
   if (assigneeId !== task.assignee_id) changes.push({ f: "assignee", from: task.assignee_name, to: await userName(env, assigneeId) });
   if (attachmentId !== task.attachment_id) changes.push({ f: "attachment", from: task.attachment_name, to: attachmentLabel });
 
-  const assignedByCommittee = isCommittee(user) && assigneeId !== user.id ? 1 : 0;
+  const assignedByCommittee = isCommittee(user) && (task.for_all === 1 || assigneeId !== user.id) ? 1 : 0;
   await env.DB.prepare(
     `UPDATE tasks SET title = ?, description = ?, due_date = ?, importance = ?, assignee_id = ?,
        assigned_by_committee = ?, attachment_id = ?, attachment_name = ?
@@ -1994,13 +2032,13 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
   }
   await recordHistory(env, id, user.id, changes);
   if (assigneeId !== task.assignee_id) await notifyUsers(env, [assigneeId]);
-  return json({ task: await loadTaskOut(env, id) });
+  return json({ task: await loadTaskOut(env, id, user.id) });
 }
 
 async function listTaskHistory(request: Request, env: Env, id: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const task = await taskById(env, id);
+  const task = await taskById(env, id, user.id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
   const rows = (
     await env.DB.prepare(
@@ -2018,11 +2056,22 @@ async function listTaskHistory(request: Request, env: Env, id: number): Promise<
 async function setTaskStatus(request: Request, env: Env, id: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const task = await taskById(env, id);
+  const task = await taskById(env, id, user.id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
-  if (!isTaskParty(user, task)) return json({ error: "Закрыть задачу может исполнитель или создатель" }, 403);
   const body = await readJson(request);
   const done = body.done === true;
+  if (task.for_all === 1) {
+    // Задача всему отряду: отметка только для самого пользователя
+    if (done) {
+      await env.DB.prepare("INSERT OR REPLACE INTO task_done (task_id, user_id, done_at) VALUES (?, ?, ?)")
+        .bind(id, user.id, new Date().toISOString())
+        .run();
+    } else {
+      await env.DB.prepare("DELETE FROM task_done WHERE task_id = ? AND user_id = ?").bind(id, user.id).run();
+    }
+    return json({ task: await loadTaskOut(env, id, user.id) });
+  }
+  if (!isTaskParty(user, task)) return json({ error: "Закрыть задачу может исполнитель или создатель" }, 403);
   await env.DB.prepare("UPDATE tasks SET status = ?, done_at = ? WHERE id = ?")
     .bind(done ? "done" : "open", done ? new Date().toISOString() : null, id)
     .run();
@@ -2037,19 +2086,20 @@ async function setTaskStatus(request: Request, env: Env, id: number): Promise<Re
     ).results.map((r) => r.id);
     await notifyUsers(env, committeeIds);
   }
-  return json({ task: await loadTaskOut(env, id) });
+  return json({ task: await loadTaskOut(env, id, user.id) });
 }
 
 async function deleteTask(request: Request, env: Env, id: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const task = await taskById(env, id);
+  const task = await taskById(env, id, user.id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
   if (task.creator_id !== user.id) return json({ error: "Удалить задачу может её создатель" }, 403);
   await env.DB.prepare("DELETE FROM task_reminders WHERE task_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM task_subtasks WHERE task_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM task_comments WHERE task_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM task_history WHERE task_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM task_done WHERE task_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM tasks WHERE id = ?").bind(id).run();
   if (task.attachment_id) await env.FILES.delete(`att:${task.attachment_id}`);
   return json({ ok: true });
@@ -2058,7 +2108,7 @@ async function deleteTask(request: Request, env: Env, id: number): Promise<Respo
 async function listTaskComments(request: Request, env: Env, id: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const task = await taskById(env, id);
+  const task = await taskById(env, id, user.id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
   const rows = (
     await env.DB.prepare(
@@ -2074,7 +2124,7 @@ async function listTaskComments(request: Request, env: Env, id: number): Promise
 async function addTaskComment(request: Request, env: Env, id: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const task = await taskById(env, id);
+  const task = await taskById(env, id, user.id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
   const body = await readJson(request);
   const text = str(body.body, TASK_COMMENT_MAX);
@@ -2092,7 +2142,7 @@ async function addTaskComment(request: Request, env: Env, id: number): Promise<R
 async function addSubtask(request: Request, env: Env, taskId: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const task = await taskById(env, taskId);
+  const task = await taskById(env, taskId, user.id);
   if (!task || !canSeeTask(user, task) || !isTaskParty(user, task)) return json({ error: "Не найдено" }, 404);
   const body = await readJson(request);
   const title = str(body.title, TASK_SUBTASK_MAX);
@@ -2103,7 +2153,7 @@ async function addSubtask(request: Request, env: Env, taskId: number): Promise<R
     .bind(taskId, title, taskId)
     .run();
   await recordHistory(env, taskId, user.id, [{ f: "subtask_add", from: null, to: title }]);
-  return json({ task: await loadTaskOut(env, taskId) }, 201);
+  return json({ task: await loadTaskOut(env, taskId, user.id) }, 201);
 }
 
 async function subtaskParent(env: Env, user: UserRow, subId: number): Promise<{ taskId: number } | null> {
@@ -2111,7 +2161,7 @@ async function subtaskParent(env: Env, user: UserRow, subId: number): Promise<{ 
     .bind(subId)
     .first<{ task_id: number }>();
   if (!sub) return null;
-  const task = await taskById(env, sub.task_id);
+  const task = await taskById(env, sub.task_id, user.id);
   if (!task || !canSeeTask(user, task) || !isTaskParty(user, task)) return null;
   return { taskId: sub.task_id };
 }
@@ -2134,7 +2184,7 @@ async function updateSubtask(request: Request, env: Env, subId: number): Promise
   if (body.done !== undefined) {
     await env.DB.prepare("UPDATE task_subtasks SET done = ? WHERE id = ?").bind(body.done === true ? 1 : 0, subId).run();
   }
-  return json({ task: await loadTaskOut(env, parent.taskId) });
+  return json({ task: await loadTaskOut(env, parent.taskId, user.id) });
 }
 
 async function deleteSubtask(request: Request, env: Env, subId: number): Promise<Response> {
@@ -2145,7 +2195,7 @@ async function deleteSubtask(request: Request, env: Env, subId: number): Promise
   const prev = await env.DB.prepare("SELECT title FROM task_subtasks WHERE id = ?").bind(subId).first<{ title: string }>();
   await env.DB.prepare("DELETE FROM task_subtasks WHERE id = ?").bind(subId).run();
   if (prev) await recordHistory(env, parent.taskId, user.id, [{ f: "subtask_remove", from: prev.title, to: null }]);
-  return json({ task: await loadTaskOut(env, parent.taskId) });
+  return json({ task: await loadTaskOut(env, parent.taskId, user.id) });
 }
 
 // ---- Push-уведомления (Web Push с ключами VAPID). Текст сообщения в push не передаётся. ----
