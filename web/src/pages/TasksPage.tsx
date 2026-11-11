@@ -193,6 +193,10 @@ function Overlay({ children, onClose }: { children: ReactNode; onClose: () => vo
 function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: number) => void }) {
   const done = task.status === "done";
   const overdue = isOverdue(task);
+  const [showAllSubs, setShowAllSubs] = useState(false);
+  // Пункты списком под задачей: важные выше, больше пяти — свёрнуты
+  const subs = [...task.subtasks].sort((x, y) => y.importance - x.importance);
+  const shownSubs = showAllSubs || subs.length <= 5 ? subs : subs.slice(0, 5);
   return (
     <div
       onClick={() => onOpen(task.id)}
@@ -213,6 +217,39 @@ function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: number) => void }
         {task.comments_count ? ` · комментариев: ${task.comments_count}` : ""}
         {task.edited_at ? " · редактировано" : ""}
       </div>
+      {subs.length > 0 && (
+        <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${colors.gray}` }}>
+          {shownSubs.map((sub) => (
+            <div key={sub.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, marginBottom: 3 }}>
+              <span
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  overflowWrap: "anywhere",
+                  color: sub.done ? colors.gray : colors.white,
+                  textDecoration: sub.done ? "line-through" : "none",
+                }}
+              >
+                {sub.done ? "☑" : "☐"} {sub.title}
+                {sub.assignee_name && <span style={{ fontSize: 12, color: colors.gray }}> · {sub.assignee_name}</span>}
+              </span>
+              <Stars value={sub.importance} />
+            </div>
+          ))}
+          {subs.length > 5 && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowAllSubs((v) => !v);
+              }}
+              style={{ ...linkButton, fontSize: 13 }}
+            >
+              {showAllSubs ? "Свернуть" : `Развернуть все (${subs.length})`}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
