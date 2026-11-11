@@ -270,7 +270,7 @@ function TaskDetail({
       )}
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
-        {isAssignee && (
+        {(isAssignee || isCreator) && (
           <button type="button" style={{ ...button, width: "auto", padding: "8px 14px", fontSize: 14 }} onClick={() => setDone(task.status !== "done")}>
             {task.status === "done" ? "Вернуть в работу" : "Отметить выполненной"}
           </button>

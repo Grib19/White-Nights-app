@@ -1861,12 +1861,25 @@ async function setTaskStatus(request: Request, env: Env, id: number): Promise<Re
   if (!user) return json({ error: "Нужен вход" }, 401);
   const task = await taskById(env, id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
-  if (task.assignee_id !== user.id) return json({ error: "Закрыть задачу может только исполнитель" }, 403);
+  if (task.assignee_id !== user.id && task.creator_id !== user.id) {
+    return json({ error: "Закрыть задачу может исполнитель или создатель" }, 403);
+  }
   const body = await readJson(request);
   const done = body.done === true;
   await env.DB.prepare("UPDATE tasks SET status = ?, done_at = ? WHERE id = ?")
     .bind(done ? "done" : "open", done ? new Date().toISOString() : null, id)
     .run();
+  // Задача, которую назначил комсостав, выполнена — уведомляем весь комсостав
+  if (done && task.status !== "done" && task.assigned_by_committee === 1) {
+    const committeeIds = (
+      await env.DB.prepare(
+        `SELECT id FROM users WHERE status = 'approved' AND role IN (${COMMITTEE.map(() => "?").join(",")}) AND id <> ?`,
+      )
+        .bind(...COMMITTEE, user.id)
+        .all<{ id: number }>()
+    ).results.map((r) => r.id);
+    await notifyUsers(env, committeeIds);
+  }
   return json({ task: await taskById(env, id) });
 }
 
