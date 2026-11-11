@@ -535,6 +535,8 @@ function TaskForm({
   const [importance, setImportance] = useState(initial?.importance ?? 3);
   const [assignee, setAssignee] = useState<string>(initial?.for_all === 1 ? "all" : String(viewer.id));
   const [needsConfirm, setNeedsConfirm] = useState(initial?.needs_confirm === 1);
+  // Подпункты при создании; у уже созданной задачи подпункты правятся в карточке
+  const [subs, setSubs] = useState<string[]>([]);
   const [confirmCondition, setConfirmCondition] = useState(initial?.confirm_condition ?? "");
   const [reminders, setReminders] = useState<string[]>(initial ? initial.reminders.map((r) => toLocalInput(r)) : []);
   // undefined — файл не трогали; null — файл убрали; строка — новый файл
@@ -591,6 +593,7 @@ function TaskForm({
       importance,
       reminders: newReminders,
     };
+    if (!initial) payload.subtasks = subs.map((x) => x.trim()).filter((x) => x);
     if (committee) {
       payload.assignee_id = assignee === "all" ? "all" : viewer.id;
       payload.needs_confirm = needsConfirm;
@@ -725,6 +728,27 @@ function TaskForm({
               );
             })}
           </fieldset>
+        )}
+        {!initial && (
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 14, marginBottom: 4 }}>Подпункты</div>
+            {subs.map((text, i) => (
+              <div key={i} style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                <input
+                  style={{ ...input, marginBottom: 0 }}
+                  value={text}
+                  maxLength={200}
+                  onChange={(e) => setSubs((cur) => cur.map((x, j) => (j === i ? e.target.value : x)))}
+                />
+                <button type="button" onClick={() => setSubs((cur) => cur.filter((_, j) => j !== i))} style={linkButton}>
+                  убрать
+                </button>
+              </div>
+            ))}
+            <button type="button" onClick={() => setSubs((cur) => [...cur, ""])} style={{ ...tabButton(false), padding: "6px 12px" }}>
+              + Подпункт
+            </button>
+          </div>
         )}
         <RemindersEditor values={reminders} onChange={setReminders} />
         <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>

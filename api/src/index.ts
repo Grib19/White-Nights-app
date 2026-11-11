@@ -2097,6 +2097,19 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   const id = Number(result.meta.last_row_id);
   await replaceReminders(env, id, reminders);
   await replaceViewers(env, id, viewers);
+  // Подпункты, заданные сразу при создании
+  const subtaskTitles: string[] = [];
+  if (Array.isArray(body.subtasks)) {
+    for (const item of body.subtasks.slice(0, 50)) {
+      const title = str(item, TASK_SUBTASK_MAX);
+      if (title) subtaskTitles.push(title);
+    }
+  }
+  for (let i = 0; i < subtaskTitles.length; i++) {
+    await env.DB.prepare("INSERT INTO task_subtasks (task_id, title, position) VALUES (?, ?, ?)")
+      .bind(id, subtaskTitles[i], i + 1)
+      .run();
+  }
   if (forAll) await notifyAllApproved(env, user.id);
   else {
     const notify = [...new Set([...viewers.map((v) => v.user_id), ...(assigneeId !== user.id ? [assigneeId] : [])])];
