@@ -1630,6 +1630,290 @@ async function leaveChat(request: Request, env: Env, chatId: number): Promise<Re
   return json({ ok: true });
 }
 
+
+// ---------- задачи ----------
+
+const TASK_TITLE_MAX = 200;
+const TASK_DESC_MAX = 4000;
+const TASK_COMMENT_MAX = 1000;
+const TASK_LIMIT = 500;
+const REMIND_BATCH = 20; // напоминаний за одну минуту (бережём лимит подзапросов Workers)
+const API_ORIGIN = "https://white-nights-api.white-nights.workers.dev";
+
+interface TaskRow {
+  id: number;
+  title: string;
+  description: string;
+  due_date: string | null;
+  importance: number;
+  creator_id: number;
+  creator_name: string;
+  assignee_id: number;
+  assignee_name: string;
+  assigned_by_committee: number;
+  attachment_id: string | null;
+  attachment_name: string | null;
+  status: string;
+  done_at: string | null;
+  remind_at: string | null;
+  created_at: string;
+  comments_count: number;
+  reminder_sent: number;
+}
+
+const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importance, t.creator_id, cu.full_name AS creator_name,
+  t.assignee_id, au.full_name AS assignee_name, t.assigned_by_committee, t.attachment_id, t.attachment_name,
+  t.status, t.done_at, t.remind_at, t.created_at, t.reminder_sent,
+  (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS comments_count
+  FROM tasks t JOIN users cu ON cu.id = t.creator_id JOIN users au ON au.id = t.assignee_id`;
+
+// Задачу видят: её создатель и исполнитель, а также весь комсостав — если задачу назначил комсостав
+function canSeeTask(user: UserRow, t: { creator_id: number; assignee_id: number; assigned_by_committee: number }): boolean {
+  return t.creator_id === user.id || t.assignee_id === user.id || (isCommittee(user) && t.assigned_by_committee === 1);
+}
+
+async function taskById(env: Env, id: number): Promise<TaskRow | null> {
+  return env.DB.prepare(`${TASK_SELECT} WHERE t.id = ?`).bind(id).first<TaskRow>();
+}
+
+function cleanDate(value: unknown): string | null {
+  const s = str(value, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+// Время напоминания приходит как ISO-строка с часовым поясом и хранится в UTC
+function cleanRemind(value: unknown): string | null {
+  const s = str(value, 40);
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
+}
+
+function cleanImportance(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 && n <= 5 ? n : fallback;
+}
+
+// Проверяет, что вложение загружено; возвращает его имя или null
+async function attachmentName(env: Env, id: string): Promise<string | null> {
+  if (!/^[A-Za-z0-9_-]{10,64}$/.test(id)) return null;
+  const att = await env.FILES.getWithMetadata<{ uploadedBy: number; name: string }>(`att:${id}`);
+  if (!att.value) return null;
+  return att.metadata?.name ?? "file";
+}
+
+// Пуш-уведомления пользователям (текст не передаётся, в браузере показывается общий заголовок)
+async function notifyUsers(env: Env, userIds: number[]): Promise<void> {
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY || userIds.length === 0) return;
+  const marks = userIds.map(() => "?").join(",");
+  const rows = (
+    await env.DB.prepare(`SELECT id, endpoint FROM push_subscriptions WHERE user_id IN (${marks}) LIMIT ?`)
+      .bind(...userIds, PUSH_MAX_SENDS)
+      .all<{ id: number; endpoint: string }>()
+  ).results;
+  await Promise.allSettled(rows.map((r) => sendPush(env, r, API_ORIGIN)));
+}
+
+// Вызывается по расписанию: шлёт напоминания, у которых подошло время
+async function sendDueReminders(env: Env): Promise<void> {
+  const due = (
+    await env.DB.prepare(
+      "SELECT id, assignee_id FROM tasks WHERE status = 'open' AND reminder_sent = 0 AND remind_at IS NOT NULL AND remind_at <= ? LIMIT ?",
+    )
+      .bind(new Date().toISOString(), REMIND_BATCH)
+      .all<{ id: number; assignee_id: number }>()
+  ).results;
+  for (const t of due) {
+    // Сначала отмечаем, чтобы при сбое напоминание не ушло дважды
+    await env.DB.prepare("UPDATE tasks SET reminder_sent = 1 WHERE id = ?").bind(t.id).run();
+    await notifyUsers(env, [t.assignee_id]);
+  }
+}
+
+async function listTasks(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const rows = (
+    await env.DB.prepare(
+      `${TASK_SELECT} WHERE t.creator_id = ? OR t.assignee_id = ? OR (? = 1 AND t.assigned_by_committee = 1)
+       ORDER BY (t.status = 'done'), (t.due_date IS NULL), t.due_date, t.importance DESC, t.id DESC LIMIT ?`,
+    )
+      .bind(user.id, user.id, isCommittee(user) ? 1 : 0, TASK_LIMIT)
+      .all<TaskRow>()
+  ).results;
+  return json({ tasks: rows.map(({ reminder_sent: _r, ...t }) => t), me: user.id });
+}
+
+// Счётчик для значка в меню: открытые задачи, которые ждут самого пользователя
+async function taskBadge(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS open FROM tasks WHERE assignee_id = ? AND status = 'open'",
+  )
+    .bind(user.id)
+    .first<{ open: number }>();
+  return json({ open: row?.open ?? 0 });
+}
+
+async function createTask(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const title = str(body.title, TASK_TITLE_MAX);
+  if (!title) return json({ error: "Укажите название задачи" }, 400);
+  const assigneeId = body.assignee_id === undefined ? user.id : Number(body.assignee_id);
+  if (!Number.isInteger(assigneeId) || assigneeId <= 0) return json({ error: "Неверный исполнитель" }, 400);
+  if (assigneeId !== user.id && !isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
+  const assignee = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'")
+    .bind(assigneeId)
+    .first<{ id: number }>();
+  if (!assignee) return json({ error: "Исполнитель не найден" }, 400);
+
+  const attachmentId = str(body.attachment_id, 64) || null;
+  let attName: string | null = null;
+  if (attachmentId) {
+    attName = await attachmentName(env, attachmentId);
+    if (!attName) return json({ error: "Файл не найден" }, 400);
+  }
+  const assignedByCommittee = isCommittee(user) && assigneeId !== user.id ? 1 : 0;
+  const result = await env.DB.prepare(
+    `INSERT INTO tasks (title, description, due_date, importance, creator_id, assignee_id, assigned_by_committee,
+       attachment_id, attachment_name, remind_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      title,
+      str(body.description, TASK_DESC_MAX),
+      cleanDate(body.due_date),
+      cleanImportance(body.importance, 3),
+      user.id,
+      assigneeId,
+      assignedByCommittee,
+      attachmentId,
+      attName,
+      cleanRemind(body.remind_at),
+    )
+    .run();
+  const id = Number(result.meta.last_row_id);
+  if (assigneeId !== user.id) await notifyUsers(env, [assigneeId]);
+  return json({ task: await taskById(env, id) }, 201);
+}
+
+// Создатель меняет всё, исполнитель — только время напоминания
+async function updateTask(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, id);
+  if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
+  const isCreator = task.creator_id === user.id;
+  if (!isCreator && task.assignee_id !== user.id) return json({ error: "Нет доступа" }, 403);
+  const body = await readJson(request);
+
+  let title = task.title;
+  let description = task.description;
+  let dueDate = task.due_date;
+  let importance = task.importance;
+  let assigneeId = task.assignee_id;
+  let attachmentId = task.attachment_id;
+  let attachmentLabel = task.attachment_name;
+  if (isCreator) {
+    if (body.title !== undefined) {
+      title = str(body.title, TASK_TITLE_MAX);
+      if (!title) return json({ error: "Укажите название задачи" }, 400);
+    }
+    if (body.description !== undefined) description = str(body.description, TASK_DESC_MAX);
+    if (body.due_date !== undefined) dueDate = cleanDate(body.due_date);
+    if (body.importance !== undefined) importance = cleanImportance(body.importance, importance);
+    if (body.assignee_id !== undefined && Number(body.assignee_id) !== task.assignee_id) {
+      if (!isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
+      const nid = Number(body.assignee_id);
+      const exists = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'").bind(nid).first();
+      if (!Number.isInteger(nid) || nid <= 0 || !exists) return json({ error: "Исполнитель не найден" }, 400);
+      assigneeId = nid;
+    }
+    if (body.attachment_id !== undefined) {
+      attachmentId = str(body.attachment_id, 64) || null;
+      attachmentLabel = null;
+      if (attachmentId) {
+        attachmentLabel = await attachmentName(env, attachmentId);
+        if (!attachmentLabel) return json({ error: "Файл не найден" }, 400);
+      }
+    }
+  }
+  const remindAt = body.remind_at !== undefined ? cleanRemind(body.remind_at) : task.remind_at;
+  const assignedByCommittee = isCommittee(user) && assigneeId !== user.id ? 1 : 0;
+  // Новое время напоминания снова включает отправку
+  await env.DB.prepare(
+    `UPDATE tasks SET title = ?, description = ?, due_date = ?, importance = ?, assignee_id = ?,
+       assigned_by_committee = ?, attachment_id = ?, attachment_name = ?, remind_at = ?,
+       reminder_sent = CASE WHEN remind_at IS ? THEN reminder_sent ELSE 0 END
+     WHERE id = ?`,
+  )
+    .bind(title, description, dueDate, importance, assigneeId, assignedByCommittee, attachmentId, attachmentLabel, remindAt, remindAt, id)
+    .run();
+  if (assigneeId !== task.assignee_id) await notifyUsers(env, [assigneeId]);
+  return json({ task: await taskById(env, id) });
+}
+
+async function setTaskStatus(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, id);
+  if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
+  if (task.assignee_id !== user.id) return json({ error: "Закрыть задачу может только исполнитель" }, 403);
+  const body = await readJson(request);
+  const done = body.done === true;
+  await env.DB.prepare("UPDATE tasks SET status = ?, done_at = ? WHERE id = ?")
+    .bind(done ? "done" : "open", done ? new Date().toISOString() : null, id)
+    .run();
+  return json({ task: await taskById(env, id) });
+}
+
+async function deleteTask(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, id);
+  if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
+  if (task.creator_id !== user.id) return json({ error: "Удалить задачу может её создатель" }, 403);
+  await env.DB.prepare("DELETE FROM tasks WHERE id = ?").bind(id).run();
+  if (task.attachment_id) await env.FILES.delete(`att:${task.attachment_id}`);
+  return json({ ok: true });
+}
+
+async function listTaskComments(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, id);
+  if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
+  const rows = (
+    await env.DB.prepare(
+      `SELECT c.id, c.body, c.created_at, c.author_id, u.full_name AS author_name
+       FROM task_comments c JOIN users u ON u.id = c.author_id WHERE c.task_id = ? ORDER BY c.id LIMIT 300`,
+    )
+      .bind(id)
+      .all()
+  ).results;
+  return json({ comments: rows });
+}
+
+async function addTaskComment(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, id);
+  if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
+  const body = await readJson(request);
+  const text = str(body.body, TASK_COMMENT_MAX);
+  if (!text) return json({ error: "Напишите комментарий" }, 400);
+  await env.DB.prepare("INSERT INTO task_comments (task_id, author_id, body) VALUES (?, ?, ?)")
+    .bind(id, user.id, text)
+    .run();
+  // Уведомляем другую сторону: если пишет исполнитель — создателя, и наоборот
+  const other = user.id === task.creator_id ? task.assignee_id : task.creator_id;
+  if (other !== user.id) await notifyUsers(env, [other]);
+  return json({ ok: true }, 201);
+}
+
 // ---- Push-уведомления (Web Push с ключами VAPID). Текст сообщения в push не передаётся. ----
 const PUSH_MAX_SENDS = 45; // Workers разрешает ограниченное число подзапросов на один запрос
 
@@ -1841,6 +2125,18 @@ export default {
       if (method === "GET" && path === "/api/posts") return await listPosts(request, env);
       if (method === "POST" && path === "/api/posts") return await addPost(request, env);
       if (method === "POST" && path === "/api/reactions") return await toggleReaction(request, env);
+
+      if (method === "GET" && path === "/api/tasks") return await listTasks(request, env);
+      if (method === "POST" && path === "/api/tasks") return await createTask(request, env);
+      if (method === "GET" && path === "/api/tasks/badge") return await taskBadge(request, env);
+      const taskMatch = path.match(/^\/api\/tasks\/(\d+)$/);
+      if (taskMatch && method === "PUT") return await updateTask(request, env, Number(taskMatch[1]));
+      if (taskMatch && method === "DELETE") return await deleteTask(request, env, Number(taskMatch[1]));
+      const taskStatusMatch = path.match(/^\/api\/tasks\/(\d+)\/status$/);
+      if (taskStatusMatch && method === "PUT") return await setTaskStatus(request, env, Number(taskStatusMatch[1]));
+      const taskCommentsMatch = path.match(/^\/api\/tasks\/(\d+)\/comments$/);
+      if (taskCommentsMatch && method === "GET") return await listTaskComments(request, env, Number(taskCommentsMatch[1]));
+      if (taskCommentsMatch && method === "POST") return await addTaskComment(request, env, Number(taskCommentsMatch[1]));
       const commentsMatch = path.match(/^\/api\/posts\/(\d+)\/comments$/);
       if (method === "GET" && commentsMatch) return await listComments(request, env, Number(commentsMatch[1]));
       if (method === "POST" && commentsMatch) return await addComment(request, env, Number(commentsMatch[1]));
@@ -1874,5 +2170,10 @@ export default {
       console.error("Ошибка", method, path, err instanceof Error ? `${err.name}: ${err.message}` : String(err));
       return json({ error: "Внутренняя ошибка сервера" }, 500);
     }
+  },
+
+  // Раз в минуту: напоминания о задачах
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(sendDueReminders(env));
   },
 };

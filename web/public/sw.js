@@ -7,7 +7,7 @@ self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim(
 self.addEventListener("push", (event) => {
   event.waitUntil(
     self.registration.showNotification("Белые Ночи", {
-      body: "Новое сообщение",
+      body: "Новое уведомление",
       tag: "chat", // одно уведомление вместо кучи
       renotify: true,
       icon: "/favicon.ico",

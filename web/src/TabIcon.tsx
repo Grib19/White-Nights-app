@@ -32,6 +32,13 @@ const paths: Record<string, ReactElement> = {
       <circle cx="16" cy="12" r="0.9" fill="currentColor" />
     </>
   ),
+  // Задачи: квадрат с галочкой
+  tasks: (
+    <>
+      <rect x="4" y="4" width="16" height="16" rx="2" />
+      <path d="M8 12l2.5 2.5L16 9" />
+    </>
+  ),
   // Лента: лист с текстом
   feed: (
     <>

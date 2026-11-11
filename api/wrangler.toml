@@ -12,3 +12,7 @@ database_id = "f000faa3-a52f-4c2d-a60b-edd5752c61e6"
 [[kv_namespaces]]
 binding = "FILES"
 id = "ab0c32ee0dd44fb290050220865706e6"
+
+# Раз в минуту проверяем напоминания о задачах и шлём push
+[triggers]
+crons = ["* * * * *"]

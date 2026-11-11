@@ -8,10 +8,11 @@ import { InfoPage } from "./pages/InfoPage";
 import { MusicPage } from "./pages/MusicPage";
 import { FeedPage } from "./pages/FeedPage";
 import { ChatsPage } from "./pages/ChatsPage";
+import { TasksPage } from "./pages/TasksPage";
 import { TabIcon } from "./TabIcon";
 
 type Mode = "login" | "register";
-type Tab = "profile" | "feed" | "chats" | "members" | "info" | "music" | "committee";
+type Tab = "profile" | "feed" | "chats" | "tasks" | "members" | "info" | "music" | "committee";
 
 type Pending = User;
 
@@ -21,6 +22,8 @@ export function App() {
   const [mode, setMode] = useState<Mode>("login");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  // Значок «Задачи» в меню: сколько открытых задач ждут пользователя
+  const [taskOpen, setTaskOpen] = useState(0);
 
   // На широком экране меню слева (как во ВКонтакте), на телефоне — полоской сверху
   const [wide, setWide] = useState(() => window.innerWidth >= 760);
@@ -31,6 +34,22 @@ export function App() {
   }, []);
 
   const isCommittee = !!user && user.status === "approved" && COMMITTEE_ROLES.includes(user.role);
+
+  async function refreshBadge() {
+    try {
+      const { status, data } = await request("/api/tasks/badge");
+      if (status === 200) setTaskOpen(data.open ?? 0);
+    } catch {
+      // Нет связи: значок просто не обновится
+    }
+  }
+
+  useEffect(() => {
+    if (!user) return;
+    refreshBadge();
+    const id = window.setInterval(refreshBadge, 60000);
+    return () => window.clearInterval(id);
+  }, [user, tab]);
 
   // Если токен сохранён, проверяем, что он ещё действует
   useEffect(() => {
@@ -82,6 +101,7 @@ export function App() {
     const tabList: [Tab, string][] = [
       ["feed", "Лента"],
       ["chats", "Чаты"],
+      ["tasks", "Задачи"],
       ["profile", "Профиль"],
       ["music", "Музыка"],
       ["members", "Участники"],
@@ -125,6 +145,11 @@ export function App() {
                 <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <TabIcon name={key} color={tab === key ? colors.navy : colors.white} />
                   {label}
+                  {key === "tasks" && taskOpen > 0 && (
+                    <span style={{ background: colors.yellow, color: colors.navy, borderRadius: 999, padding: "0 7px", fontSize: 12, fontWeight: "bold" }}>
+                      {taskOpen}
+                    </span>
+                  )}
                 </span>
               </button>
             ))}
@@ -133,6 +158,7 @@ export function App() {
           <div style={{ flex: 1, minWidth: 0 }}>
             {tab === "feed" && <FeedPage viewer={user} />}
             {tab === "chats" && <ChatsPage viewer={user} />}
+            {tab === "tasks" && <TasksPage viewer={user} onChanged={refreshBadge} />}
             {tab === "profile" && <ProfilePage user={user} />}
             {tab === "members" && <MembersPage viewer={user} />}
             {tab === "info" && <InfoPage viewer={user} />}
