@@ -547,15 +547,12 @@ function CommentsBlock({ postId, onChanged }: { postId: number; onChanged: () =>
 function PostPhoto({ id }: { id: string }) {
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
-    let url: string | null = null;
     let alive = true;
     loadImage(id).then((u) => {
-      url = u;
       if (alive) setSrc(u);
     });
     return () => {
       alive = false;
-      if (url) URL.revokeObjectURL(url);
     };
   }, [id]);
   if (!src) return null;

@@ -43,14 +43,7 @@ export function ProfilePage({ user }: { user: User }) {
 
   useEffect(() => {
     if (!pub.photo_id) return setPhoto(null);
-    let url: string | null = null;
-    loadImage(pub.photo_id).then((u) => {
-      url = u;
-      setPhoto(u);
-    });
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-    };
+    loadImage(pub.photo_id).then(setPhoto);
   }, [pub.photo_id]);
 
   async function onPhoto(e: ChangeEvent<HTMLInputElement>) {

@@ -51,6 +51,19 @@ interface Msg {
 
 const PAGE = 50;
 const MAX_FILE = 20 * 1024 * 1024;
+// Голосовое длиннее этого срока обрывается автоматически (так файл остаётся небольшим)
+const MAX_VOICE_SECONDS = 300;
+
+// Формат записи, который поддерживает браузер (Chrome/Edge — webm, Safari — mp4)
+function pickAudioMime(): string | undefined {
+  if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return undefined;
+  return ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"].find((m) => MediaRecorder.isTypeSupported(m));
+}
+
+function formatDuration(totalSeconds: number): string {
+  const m = Math.floor(totalSeconds / 60);
+  return `${m}:${String(totalSeconds % 60).padStart(2, "0")}`;
+}
 
 // Настройки уведомлений: хранятся в браузере на этом устройстве
 function readSetting(key: string, fallback: boolean): boolean {
@@ -74,17 +87,9 @@ function writeSetting(key: string, value: boolean): void {
 function ChatAvatar({ photoId, title, size = 40 }: { photoId: string | null; title: string; size?: number }) {
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
-    let url: string | null = null;
     setSrc(null);
-    if (photoId) {
-      loadImage(photoId).then((u) => {
-        url = u;
-        setSrc(u);
-      });
-    }
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-    };
+    // Адрес картинки берётся из общего кеша и не отзывается: при повторном открытии он ещё рабочий
+    if (photoId) loadImage(photoId).then(setSrc);
   }, [photoId]);
   const box: CSSProperties = {
     width: size,
@@ -126,6 +131,7 @@ function shortDate(iso: string): string {
 
 function previewOf(chat: ChatItem): string {
   if (chat.last_kind === "image") return "📷 Фото";
+  if (chat.last_kind === "audio") return "🎤 Голосовое";
   if (chat.last_kind === "file") return "📎 Файл";
   return chat.last_body ?? "Нет сообщений";
 }
@@ -200,7 +206,7 @@ export function ChatsPage({ viewer }: { viewer: User }) {
     const preview = readSetting("chat-notify-preview", true);
     try {
       new Notification(msg.author_name, {
-        body: !preview ? "Новое сообщение" : msg.body || (msg.attachment_kind === "image" ? "📷 Фото" : "📎 Файл"),
+        body: !preview ? "Новое сообщение" : msg.body || (msg.attachment_kind === "image" ? "📷 Фото" : msg.attachment_kind === "audio" ? "🎤 Голосовое" : "📎 Файл"),
         tag: `chat-${msg.chat_id}`,
       });
     } catch {
@@ -539,6 +545,11 @@ function ChatView({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+  const [recording, setRecording] = useState(false);
+  const [recSeconds, setRecSeconds] = useState(0);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const recCancelRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const committee = COMMITTEE_ROLES.includes(viewer.role);
   const moderated = committee && (chat.kind === "general" || chat.kind === "committee");
@@ -674,6 +685,94 @@ function ChatView({
       if (status === 201) {
         merge([data.message]);
         setText("");
+        setReplyTo(null);
+      } else setErr(data.error ?? "Не удалось отправить");
+    } catch {
+      setErr("Нет связи с сервером");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Таймер записи
+  useEffect(() => {
+    if (!recording) return;
+    const id = window.setInterval(() => setRecSeconds((s) => s + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [recording]);
+
+  // Лимит длительности: по достижении запись отправляется сама
+  useEffect(() => {
+    if (recording && recSeconds >= MAX_VOICE_SECONDS) finishRecording(true);
+  }, [recording, recSeconds]);
+
+  // Уход из чата во время записи: микрофон отпускаем, запись не отправляем
+  useEffect(() => {
+    return () => {
+      recCancelRef.current = true;
+      if (recorderRef.current && recorderRef.current.state !== "inactive") recorderRef.current.stop();
+    };
+  }, []);
+
+  async function startRecording() {
+    if (busy || recording) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setErr("Голосовые сообщения не поддерживаются в этом браузере");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mime = pickAudioMime();
+      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      chunksRef.current = [];
+      recCancelRef.current = false;
+      rec.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      rec.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(chunksRef.current, { type: rec.mimeType || mime || "audio/webm" });
+        chunksRef.current = [];
+        if (!recCancelRef.current && blob.size > 0) sendVoice(blob);
+      };
+      recorderRef.current = rec;
+      setRecSeconds(0);
+      setErr("");
+      rec.start();
+      setRecording(true);
+    } catch {
+      setErr("Нет доступа к микрофону. Разрешите его в настройках браузера.");
+    }
+  }
+
+  function finishRecording(send: boolean) {
+    const rec = recorderRef.current;
+    recorderRef.current = null;
+    recCancelRef.current = !send;
+    setRecording(false);
+    if (rec && rec.state !== "inactive") rec.stop();
+  }
+
+  async function sendVoice(blob: Blob) {
+    setBusy(true);
+    setErr("");
+    try {
+      const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
+      const file = new File([blob], `Голосовое ${new Date().toLocaleString("ru-RU").replace(/[:\s,]+/g, "-")}.${ext}`, { type: blob.type });
+      const up = await uploadAttachment(file);
+      if (!up.ok || !up.id) {
+        setErr(up.error ?? "Не удалось отправить голосовое");
+        return;
+      }
+      const { status, data } = await request(`/api/chats/${chat.id}/messages`, "POST", {
+        body: "",
+        attachment_id: up.id,
+        attachment_name: file.name,
+        attachment_kind: "audio",
+        reply_to_id: replyTo?.id ?? null,
+      });
+      if (status === 201) {
+        merge([data.message]);
         setReplyTo(null);
       } else setErr(data.error ?? "Не удалось отправить");
     } catch {
@@ -904,7 +1003,8 @@ function ChatView({
                 ) : (
                   <>
                     {m.attachment_id && m.attachment_kind === "image" && <AttachmentImage id={m.attachment_id} name={m.attachment_name ?? "фото"} />}
-                    {m.attachment_id && m.attachment_kind !== "image" && (
+                    {m.attachment_id && m.attachment_kind === "audio" && <AudioMessage id={m.attachment_id} />}
+                    {m.attachment_id && m.attachment_kind !== "image" && m.attachment_kind !== "audio" && (
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -1072,10 +1172,11 @@ function ChatView({
                 if (f) attach(f);
               }}
             />
-            <button type="button" onClick={() => fileRef.current?.click()} disabled={busy} aria-label="Прикрепить файл" style={composerIconButton}>
+            <button type="button" onClick={() => fileRef.current?.click()} disabled={busy} aria-label="Прикрепить файл" hidden={recording} style={composerIconButton}>
               <ClipIcon />
             </button>
             <textarea
+              hidden={recording}
               ref={textRef}
               value={text}
               onChange={(e) => setText(e.target.value)}
@@ -1103,18 +1204,32 @@ function ChatView({
             <button
               type="button"
               data-emoji-toggle
+              hidden={recording}
               onClick={() => setPickerOpen((open) => !open)}
               aria-label="Смайлики"
               style={{ ...composerIconButton, color: pickerOpen ? colors.yellow : composerIconButton.color }}
             >
               <SmileIcon />
             </button>
-            {text.trim() ? (
+            {recording ? (
+              <>
+                <button type="button" onClick={() => finishRecording(false)} aria-label="Отменить запись" style={{ ...composerIconButton, fontSize: 18 }}>
+                  ✕
+                </button>
+                <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, color: "#ff8a8a", fontSize: 15 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: 5, background: "#ff5c5c" }} />
+                  {formatDuration(recSeconds)}
+                </div>
+                <button type="button" onClick={() => finishRecording(true)} aria-label="Отправить голосовое" style={composerIconButton}>
+                  <SendIcon />
+                </button>
+              </>
+            ) : text.trim() ? (
               <button type="submit" disabled={busy} aria-label="Отправить" style={composerIconButton}>
                 <SendIcon />
               </button>
             ) : (
-              <button type="button" disabled aria-label="Голосовое сообщение" style={composerIconButton}>
+              <button type="button" onClick={startRecording} disabled={busy} aria-label="Голосовое сообщение" style={composerIconButton}>
                 <MicIcon />
               </button>
             )}
@@ -1273,17 +1388,22 @@ const linkStyle: CSSProperties = {
 function AttachmentImage({ id, name }: { id: string; name: string }) {
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
-    let url: string | null = null;
-    loadAttachmentUrl(id).then((u) => {
-      url = u;
-      setSrc(u);
-    });
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-    };
+    // Адрес из общего кеша не отзываем (см. api.ts), иначе после переключения раздела картинка пропадёт
+    loadAttachmentUrl(id).then(setSrc);
   }, [id]);
   if (!src) return <div style={{ fontSize: 13, color: colors.gray }}>Загрузка фото…</div>;
   return <img src={src} alt={name} style={{ display: "block", maxWidth: 260, maxHeight: 260, borderRadius: 8, marginBottom: 4 }} />;
+}
+
+function AudioMessage({ id }: { id: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    loadAttachmentUrl(id).then((u) => (u ? setSrc(u) : setFailed(true)));
+  }, [id]);
+  if (failed) return <div style={{ fontSize: 13, color: colors.gray }}>Не удалось загрузить голосовое</div>;
+  if (!src) return <div style={{ fontSize: 13, color: colors.gray }}>Загрузка голосового…</div>;
+  return <audio controls preload="metadata" src={src} style={{ display: "block", maxWidth: "100%", marginBottom: 4 }} />;
 }
 
 function NewChatPanel({

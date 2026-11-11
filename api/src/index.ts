@@ -1399,7 +1399,8 @@ async function sendMessage(request: Request, env: Env, chatId: number): Promise<
   const text = str(body.body, CHAT_MESSAGE_MAX);
   const attachmentId = str(body.attachment_id, 64);
   const attachmentName = str(body.attachment_name, 200) || null;
-  const attachmentKind = body.attachment_kind === "image" ? "image" : attachmentId ? "file" : null;
+  const attachmentKind =
+    body.attachment_kind === "image" ? "image" : body.attachment_kind === "audio" && attachmentId ? "audio" : attachmentId ? "file" : null;
   if (attachmentId && !/^[A-Za-z0-9_-]{10,64}$/.test(attachmentId)) return json({ error: "Неверный файл" }, 400);
   if (!text && !attachmentId) return json({ error: "Напишите сообщение или прикрепите файл" }, 400);
   const replyId = Number(body.reply_to_id) || 0;

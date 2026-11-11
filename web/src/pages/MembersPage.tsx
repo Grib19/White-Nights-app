@@ -56,14 +56,7 @@ function Avatar({ photoId, size = 48 }: { photoId: string | null; size?: number 
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
     if (!photoId) return setSrc(null);
-    let url: string | null = null;
-    loadImage(photoId).then((u) => {
-      url = u;
-      setSrc(u);
-    });
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-    };
+    loadImage(photoId).then(setSrc);
   }, [photoId]);
   return src ? (
     <img src={src} alt="" style={{ width: size, height: size, borderRadius: 8, objectFit: "cover", flexShrink: 0 }} />
