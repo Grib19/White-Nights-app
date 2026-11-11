@@ -233,12 +233,11 @@ function SortBar({ levels, onChange }: { levels: SortLevel[]; onChange: (l: Sort
       </div>
     );
   }
-  const nextField = (Object.keys(SORT_LABELS) as SortField[]).find((f) => !levels.some((l) => l.field === f)) ?? "due";
   return (
     <div style={{ ...card, padding: 10, marginBottom: 12 }}>
       {levels.map((lv, i) => (
         <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
-          <span style={{ fontSize: 13, color: colors.gray, minWidth: 56 }}>{i === 0 ? "Сначала" : "Затем"}</span>
+          <span style={{ fontSize: 13, color: colors.gray, minWidth: 56 }}>Сортировка</span>
           <select style={{ ...input, width: "auto", margin: 0 }} value={lv.field} onChange={(e) => update(i, { field: e.target.value as SortField })}>
             {(Object.keys(SORT_LABELS) as SortField[])
               .filter((f) => f === lv.field || !levels.some((l) => l.field === f))
@@ -256,16 +255,9 @@ function SortBar({ levels, onChange }: { levels: SortLevel[]; onChange: (l: Sort
           </button>
         </div>
       ))}
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-        {levels.length < 4 && (
-          <button type="button" onClick={() => onChange([...levels, { field: nextField, dir: "asc" }])} style={linkButton}>
-            + Добавить уровень
-          </button>
-        )}
-        <button type="button" onClick={() => onChange([])} style={linkButton}>
-          Сбросить сортировку
-        </button>
-      </div>
+      <button type="button" onClick={() => onChange([])} style={linkButton}>
+        Сбросить сортировку
+      </button>
     </div>
   );
 }
