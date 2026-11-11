@@ -639,19 +639,26 @@ async function loadPolls(env: Env, postIds: number[], userId: number): Promise<M
 async function listPosts(request: Request, env: Env): Promise<Response> {
   const viewer = await approvedUser(request, env);
   if (!viewer) return json({ error: "Нужен вход" }, 401);
-  const section = new URL(request.url).searchParams.get("section") === "important" ? "important" : "posts";
-  const rows = (
+  const url = new URL(request.url);
+  const section = url.searchParams.get("section") === "important" ? "important" : "posts";
+  // Постраничная загрузка: before — id последнего поста, который уже на экране; limit — сколько дать
+  const before = Math.max(0, parseInt(url.searchParams.get("before") ?? "0", 10) || 0);
+  const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get("limit") ?? "20", 10) || 20));
+  const fetched = (
     await env.DB.prepare(
       `SELECT p.id, p.body, p.photo_id, p.text_position, p.attachment_id, p.attachment_name,
               p.created_at, p.author_id, u.full_name AS author_name,
               (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comments_count
          FROM posts p JOIN users u ON u.id = p.author_id
-        WHERE p.section = ?
-        ORDER BY p.created_at DESC, p.id DESC LIMIT 100`,
+        WHERE p.section = ? AND (? = 0 OR p.id < ?)
+        ORDER BY p.id DESC LIMIT ?`,
     )
-      .bind(section)
+      .bind(section, before, before, limit + 1)
       .all()
   ).results as Array<{ id: number }>;
+  // Лишняя запись нужна только чтобы понять, есть ли ещё посты
+  const hasMore = fetched.length > limit;
+  const rows = hasMore ? fetched.slice(0, limit) : fetched;
   const polls = await loadPolls(
     env,
     rows.map((r) => r.id),
@@ -668,6 +675,7 @@ async function listPosts(request: Request, env: Env): Promise<Response> {
     viewer_id: viewer.id,
     viewer_committee: isCommittee(viewer),
     can_post_important: await canPostImportant(env, viewer),
+    has_more: hasMore,
   });
 }
 

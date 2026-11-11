@@ -73,6 +73,8 @@ const MAX_OPTIONS = 10;
 // Лента новостей: посты с текстом, фото, файлом и опросом. Удалить может автор или комсостав.
 export function FeedPage({ viewer }: { viewer: User }) {
   const [posts, setPosts] = useState<Post[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [committee, setCommittee] = useState(false);
   const [message, setMessage] = useState("");
   // Раздел ленты: «Важное» (пишут комсостав и отмеченные им) или «Посты» (пишет кто угодно)
@@ -99,13 +101,28 @@ export function FeedPage({ viewer }: { viewer: User }) {
   const hasMedia = !!attached || pollOn;
   const canPublish = !!body.trim() || !!attached || (pollOn && !!question.trim());
 
+  // Первая страница ленты (заменяет то, что было на экране)
   async function load() {
     const { status, data } = await request(`/api/posts?section=${section}`);
     if (status === 200) {
       setPosts(data.posts ?? []);
+      setHasMore(!!data.has_more);
       setCommittee(!!data.viewer_committee);
       setCanImportant(!!data.can_post_important);
     } else setMessage(data.error ?? "Не удалось загрузить ленту");
+  }
+
+  // Следующая страница: добавляет посты старше последнего на экране
+  async function loadMore() {
+    const last = posts[posts.length - 1];
+    if (!last) return;
+    setLoadingMore(true);
+    const { status, data } = await request(`/api/posts?section=${section}&before=${last.id}`);
+    setLoadingMore(false);
+    if (status === 200) {
+      setPosts((prev) => [...prev, ...(data.posts ?? [])]);
+      setHasMore(!!data.has_more);
+    } else setMessage(data.error ?? "Не удалось загрузить посты");
   }
 
   useEffect(() => {
@@ -298,6 +315,11 @@ export function FeedPage({ viewer }: { viewer: User }) {
           onChanged={load}
         />
       ))}
+      {hasMore && (
+        <button style={{ ...button, width: "100%", marginBottom: 16 }} onClick={loadMore} disabled={loadingMore}>
+          {loadingMore ? "Загрузка…" : "Загрузить ещё"}
+        </button>
+      )}
       {message && <p>{message}</p>}
     </section>
   );
