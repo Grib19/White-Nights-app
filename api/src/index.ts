@@ -1969,7 +1969,7 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
 
   const changes: HistoryChange[] = [];
   if (title !== task.title) changes.push({ f: "title", from: task.title, to: title });
-  if (description !== task.description) changes.push({ f: "description", from: null, to: null });
+  if (description !== task.description) changes.push({ f: "description", from: task.description, to: description });
   if (dueDate !== task.due_date) changes.push({ f: "due_date", from: task.due_date, to: dueDate });
   if (importance !== task.importance) changes.push({ f: "importance", from: String(task.importance), to: String(importance) });
   if (assigneeId !== task.assignee_id) changes.push({ f: "assignee", from: task.assignee_name, to: await userName(env, assigneeId) });

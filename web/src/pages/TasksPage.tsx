@@ -45,32 +45,38 @@ interface HistoryEntry {
   changes: HistoryChange[];
 }
 
-function describeChange(c: HistoryChange): string {
+// Что было и что стало для одного изменения в истории
+function changeView(c: HistoryChange): { label: string; before: string; after: string } {
+  const dash = "—";
   switch (c.f) {
     case "title":
-      return `Название: «${c.from}» → «${c.to}»`;
+      return { label: "Название", before: c.from ?? dash, after: c.to ?? dash };
     case "description":
-      return "Описание изменено";
+      return {
+        label: "Описание",
+        before: c.from === null ? "не сохранялось" : c.from === "" ? "пусто" : c.from,
+        after: c.to === "" ? "пусто" : c.to ?? dash,
+      };
     case "due_date":
-      return `Срок: ${c.from ? formatDate(c.from) : "без срока"} → ${c.to ? formatDate(c.to) : "без срока"}`;
+      return { label: "Срок", before: c.from ? formatDate(c.from) : "без срока", after: c.to ? formatDate(c.to) : "без срока" };
     case "importance":
-      return `Важность: ${c.from} → ${c.to}`;
+      return { label: "Важность", before: `${c.from} из 5`, after: `${c.to} из 5` };
     case "assignee":
-      return `Исполнитель: ${c.from} → ${c.to}`;
+      return { label: "Исполнитель", before: c.from ?? dash, after: c.to ?? dash };
     case "attachment":
-      return c.to ? `Файл: ${c.to}` : "Файл удалён";
+      return { label: "Файл", before: c.from ?? "нет", after: c.to ?? "нет" };
     case "reminder_add":
-      return `Напоминание добавлено: ${formatWhen(c.to ?? "")}`;
+      return { label: "Напоминание", before: dash, after: formatWhen(c.to ?? "") };
     case "reminder_remove":
-      return `Напоминание удалено: ${formatWhen(c.from ?? "")}`;
+      return { label: "Напоминание", before: formatWhen(c.from ?? ""), after: dash };
     case "subtask_add":
-      return `Пункт добавлен: «${c.to}»`;
+      return { label: "Подпункт", before: dash, after: c.to ?? dash };
     case "subtask_rename":
-      return `Пункт переименован: «${c.from}» → «${c.to}»`;
+      return { label: "Подпункт", before: c.from ?? dash, after: c.to ?? dash };
     case "subtask_remove":
-      return `Пункт удалён: «${c.from}»`;
+      return { label: "Подпункт", before: c.from ?? dash, after: dash };
     default:
-      return "Изменено";
+      return { label: "Изменено", before: dash, after: dash };
   }
 }
 
@@ -228,11 +234,22 @@ function HistoryModal({ taskId, onClose }: { taskId: number; onClose: () => void
           <div style={{ fontSize: 13, color: colors.blue }}>
             {formatWhen(e.created_at)} · <b>{e.user_name}</b>
           </div>
-          {e.changes.map((c, i) => (
-            <div key={i} style={{ fontSize: 14, overflowWrap: "anywhere" }}>
-              {describeChange(c)}
-            </div>
-          ))}
+          {e.changes.map((c, i) => {
+            const v = changeView(c);
+            return (
+              <div key={i} style={{ marginTop: 8 }}>
+                <div style={{ fontSize: 13, color: colors.blue }}>{v.label}</div>
+                <div style={{ fontSize: 14, color: colors.gray }}>
+                  было:{" "}
+                  <span style={{ color: colors.white, textDecoration: "line-through", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{v.before}</span>
+                </div>
+                <div style={{ fontSize: 14, color: colors.gray }}>
+                  стало:{" "}
+                  <span style={{ color: colors.yellow, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{v.after}</span>
+                </div>
+              </div>
+            );
+          })}
         </div>
       ))}
     </Overlay>
