@@ -1665,6 +1665,8 @@ interface TaskRow {
   done_count: number;
   members_total: number;
   viewers_json: string | null;
+  needs_confirm: number;
+  confirm_condition: string | null;
 }
 
 interface SubtaskRow {
@@ -1676,7 +1678,7 @@ interface SubtaskRow {
 
 const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importance, t.creator_id, cu.full_name AS creator_name,
   t.assignee_id, au.full_name AS assignee_name, t.assigned_by_committee, t.attachment_id, t.attachment_name,
-  t.for_all,
+  t.for_all, t.needs_confirm, t.confirm_condition,
   CASE WHEN t.for_all = 1 THEN (CASE WHEN EXISTS (SELECT 1 FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?) THEN 'done' ELSE 'open' END) ELSE t.status END AS status,
   CASE WHEN t.for_all = 1 THEN (SELECT d.done_at FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?) ELSE t.done_at END AS done_at,
   t.created_at, t.edited_at,
@@ -1684,7 +1686,7 @@ const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importan
   (SELECT COUNT(*) FROM task_done d WHERE d.task_id = t.id) AS done_count,
   (SELECT COUNT(*) FROM users WHERE status = 'approved') AS members_total,
   (SELECT group_concat(r.remind_at, '|') FROM task_reminders r WHERE r.task_id = t.id) AS reminders_raw,
-  (SELECT json_group_array(json_object('user_id', a.user_id, 'can_edit', a.can_edit, 'name', vu.full_name))
+  (SELECT json_group_array(json_object('user_id', a.user_id, 'can_edit', a.can_edit, 'is_executor', a.is_executor, 'name', vu.full_name))
      FROM task_access a JOIN users vu ON vu.id = a.user_id WHERE a.task_id = t.id) AS viewers_json
   FROM tasks t JOIN users cu ON cu.id = t.creator_id JOIN users au ON au.id = t.assignee_id`;
 
@@ -1705,11 +1707,33 @@ interface TaskAccessFields {
   assigned_by_committee: number;
   for_all?: number;
   viewers_json?: string | null;
+  needs_confirm?: number;
+}
+
+// Исполнители — видящие, отмеченные как исполнитель (если никого нет — исполнитель создатель/назначенный)
+function executorCount(t: { viewers_json?: string | null }): number {
+  return parseViewers(t.viewers_json).filter((v) => v.is_executor === 1).length;
+}
+
+function isExecutorOf(user: UserRow, t: TaskAccessFields): boolean {
+  return t.assignee_id === user.id || parseViewers(t.viewers_json).some((v) => v.user_id === user.id && v.is_executor === 1);
+}
+
+// Выполнение нужно подтвердить: комсостав поставил задачу, стоит галочка или исполнителей несколько
+function requiresConfirm(t: TaskAccessFields): boolean {
+  return t.needs_confirm === 1 || t.assigned_by_committee === 1 || executorCount(t) > 1;
+}
+
+// Подтверждает выполнение: при нескольких исполнителях — только создатель, иначе — комсостав
+function canConfirm(user: UserRow, t: TaskAccessFields & { creator_id: number }): boolean {
+  if (executorCount(t) > 1) return t.creator_id === user.id;
+  return (t.assigned_by_committee === 1 || t.needs_confirm === 1) && isCommittee(user);
 }
 
 interface ViewerItem {
   user_id: number;
   can_edit: number;
+  is_executor?: number;
   name?: string;
 }
 
@@ -1736,8 +1760,8 @@ function isLocked(t: TaskRow): boolean {
 }
 
 // Создатель, исполнитель и видящие с правом редактирования
-function isTaskParty(user: UserRow, t: TaskAccessFields): boolean {
-  return t.creator_id === user.id || t.assignee_id === user.id || viewerAccess(user, t) === 1;
+function isTaskParty(user: UserRow, t: TaskAccessFields & { creator_id: number }): boolean {
+  return t.creator_id === user.id || isExecutorOf(user, t) || viewerAccess(user, t) === 1;
 }
 
 async function taskById(env: Env, id: number, viewerId: number): Promise<TaskRow | null> {
@@ -1750,7 +1774,7 @@ function shapeTask(row: TaskRow, subtasks: SubtaskRow[]) {
   return {
     ...rest,
     reminders,
-    viewers: parseViewers(viewers_json).map((v) => ({ user_id: v.user_id, can_edit: v.can_edit, name: v.name ?? "" })),
+    viewers: parseViewers(viewers_json).map((v) => ({ user_id: v.user_id, can_edit: v.can_edit, is_executor: v.is_executor ?? 0, name: v.name ?? "" })),
     subtasks: subtasks.map((s) => ({ id: s.id, title: s.title, done: s.done })),
   };
 }
@@ -1937,31 +1961,77 @@ async function taskBadge(request: Request, env: Env): Promise<Response> {
   return json({ open: row?.open ?? 0 });
 }
 
-// Список видящих: только одобренные пользователи, без создателя и исполнителя
-async function cleanViewers(env: Env, raw: unknown, skip: number[]): Promise<{ user_id: number; can_edit: number }[] | string> {
+// Список видящих: только одобренные пользователи, без создателя
+async function cleanViewers(
+  env: Env,
+  raw: unknown,
+  skip: number[],
+): Promise<{ user_id: number; can_edit: number; is_executor: number }[] | string> {
   if (!Array.isArray(raw)) return "Неверный список видящих";
-  const picked = new Map<number, number>();
+  const picked = new Map<number, { can_edit: number; is_executor: number }>();
   for (const item of raw.slice(0, 200)) {
-    const v = item as { user_id?: unknown; can_edit?: unknown } | null;
+    const v = item as { user_id?: unknown; can_edit?: unknown; is_executor?: unknown } | null;
     const uid = Number(v?.user_id);
     if (!Number.isInteger(uid) || uid <= 0) return "Неверный список видящих";
     if (skip.includes(uid)) continue;
-    picked.set(uid, v?.can_edit === true ? 1 : 0);
+    picked.set(uid, { can_edit: v?.can_edit === true ? 1 : 0, is_executor: v?.is_executor === true ? 1 : 0 });
   }
   for (const uid of picked.keys()) {
     const ok = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'").bind(uid).first();
     if (!ok) return "Пользователь не найден";
   }
-  return [...picked].map(([user_id, can_edit]) => ({ user_id, can_edit }));
+  return [...picked].map(([user_id, f]) => ({ user_id, ...f }));
 }
 
-async function replaceViewers(env: Env, taskId: number, list: { user_id: number; can_edit: number }[]): Promise<void> {
+async function replaceViewers(
+  env: Env,
+  taskId: number,
+  list: { user_id: number; can_edit: number; is_executor: number }[],
+): Promise<void> {
   await env.DB.prepare("DELETE FROM task_access WHERE task_id = ?").bind(taskId).run();
   for (const v of list) {
-    await env.DB.prepare("INSERT INTO task_access (task_id, user_id, can_edit) VALUES (?, ?, ?)")
-      .bind(taskId, v.user_id, v.can_edit)
+    await env.DB.prepare("INSERT INTO task_access (task_id, user_id, can_edit, is_executor) VALUES (?, ?, ?, ?)")
+      .bind(taskId, v.user_id, v.can_edit, v.is_executor)
       .run();
   }
+}
+
+// Уведомляет тех, кто должен подтвердить выполнение
+async function notifyConfirmers(env: Env, t: TaskAccessFields & { creator_id: number }, exceptId: number): Promise<void> {
+  if (executorCount(t) > 1) {
+    if (t.creator_id !== exceptId) await notifyUsers(env, [t.creator_id]);
+    return;
+  }
+  const ids = (
+    await env.DB.prepare(
+      `SELECT id FROM users WHERE status = 'approved' AND role IN (${COMMITTEE.map(() => "?").join(",")}) AND id <> ?`,
+    )
+      .bind(...COMMITTEE, exceptId)
+      .all<{ id: number }>()
+  ).results.map((r) => r.id);
+  if (ids.length) await notifyUsers(env, ids);
+}
+
+// Все подпункты выполнены — задача выполняется сама; снят хотя бы один — открывается снова
+async function syncSubtaskStatus(env: Env, taskId: number): Promise<void> {
+  const c = await env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(done), 0) AS done FROM task_subtasks WHERE task_id = ?")
+    .bind(taskId)
+    .first<{ total: number; done: number }>();
+  if (!c || c.total === 0) return;
+  const t = await taskById(env, taskId, 0);
+  if (!t || t.for_all === 1) return;
+  let next: string;
+  if (c.done !== c.total) {
+    if (t.status === "open") return;
+    next = "open";
+  } else {
+    next = requiresConfirm(t) ? "waiting" : "done";
+  }
+  if (t.status === next) return;
+  await env.DB.prepare("UPDATE tasks SET status = ?, done_at = ? WHERE id = ?")
+    .bind(next, next === "done" ? new Date().toISOString() : null, taskId)
+    .run();
+  if (next === "waiting") await notifyConfirmers(env, t, 0);
 }
 
 async function createTask(request: Request, env: Env): Promise<Response> {
@@ -1972,7 +2042,7 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   if (!title) return json({ error: "Укажите название задачи" }, 400);
   const forAll = body.assignee_id === "all";
   if (forAll && !isCommittee(user)) return json({ error: "Задачу всему отряду ставит комсостав" }, 403);
-  const assigneeId = forAll || body.assignee_id === undefined ? user.id : Number(body.assignee_id);
+  let assigneeId = forAll || body.assignee_id === undefined ? user.id : Number(body.assignee_id);
   if (!Number.isInteger(assigneeId) || assigneeId <= 0) return json({ error: "Неверный исполнитель" }, 400);
   if (!forAll && assigneeId !== user.id && !isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
   const assignee = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'")
@@ -1993,13 +2063,21 @@ async function createTask(request: Request, env: Env): Promise<Response> {
     attName = await attachmentName(env, attachmentId);
     if (!attName) return json({ error: "Файл не найден" }, 400);
   }
-  const viewers = body.viewers === undefined ? [] : await cleanViewers(env, body.viewers, [user.id, assigneeId]);
+  let viewers = body.viewers === undefined ? [] : await cleanViewers(env, body.viewers, [user.id]);
   if (typeof viewers === "string") return json({ error: viewers }, 400);
+  if (forAll) viewers = viewers.map((v) => ({ ...v, is_executor: 0 }));
+  const execs = viewers.filter((v) => v.is_executor === 1);
+  if (!forAll && execs.length) {
+    if (!isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
+    assigneeId = execs[0].user_id;
+  }
+  const needsConfirm = isCommittee(user) && body.needs_confirm === true ? 1 : 0;
+  const confirmCondition = needsConfirm ? str(body.confirm_condition, 500) || null : null;
   const assignedByCommittee = isCommittee(user) && (forAll || assigneeId !== user.id) ? 1 : 0;
   const result = await env.DB.prepare(
     `INSERT INTO tasks (title, description, due_date, importance, creator_id, assignee_id, assigned_by_committee,
-       attachment_id, attachment_name, for_all)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       attachment_id, attachment_name, for_all, needs_confirm, confirm_condition)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       title,
@@ -2012,6 +2090,8 @@ async function createTask(request: Request, env: Env): Promise<Response> {
       attachmentId,
       attName,
       forAll ? 1 : 0,
+      needsConfirm,
+      confirmCondition,
     )
     .run();
   const id = Number(result.meta.last_row_id);
@@ -2019,7 +2099,7 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   await replaceViewers(env, id, viewers);
   if (forAll) await notifyAllApproved(env, user.id);
   else {
-    const notify = [...viewers.map((v) => v.user_id), ...(assigneeId !== user.id ? [assigneeId] : [])];
+    const notify = [...new Set([...viewers.map((v) => v.user_id), ...(assigneeId !== user.id ? [assigneeId] : [])])];
     if (notify.length) await notifyUsers(env, notify);
   }
   return json({ task: await loadTaskOut(env, id, user.id) }, 201);
@@ -2080,12 +2160,22 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
     }
   }
   // Видящих может менять только создатель
-  let newViewers: { user_id: number; can_edit: number }[] | null = null;
+  let newViewers: { user_id: number; can_edit: number; is_executor: number }[] | null = null;
   if (isCreator && body.viewers !== undefined) {
-    const cleaned = await cleanViewers(env, body.viewers, [task.creator_id, assigneeId]);
+    const cleaned = await cleanViewers(env, body.viewers, [task.creator_id]);
     if (typeof cleaned === "string") return json({ error: cleaned }, 400);
-    newViewers = cleaned;
+    newViewers = task.for_all === 1 ? cleaned.map((v) => ({ ...v, is_executor: 0 })) : cleaned;
+    const execs = newViewers.filter((v) => v.is_executor === 1);
+    if (task.for_all !== 1) {
+      if (execs.length && !isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
+      assigneeId = execs.length ? execs[0].user_id : task.creator_id;
+    }
   }
+  let needsConfirm = task.needs_confirm;
+  let confirmCondition = task.confirm_condition;
+  if (isCommittee(user) && body.needs_confirm !== undefined) needsConfirm = body.needs_confirm === true ? 1 : 0;
+  if (isCommittee(user) && body.confirm_condition !== undefined) confirmCondition = str(body.confirm_condition, 500) || null;
+  if (!needsConfirm) confirmCondition = null;
   // Новые напоминания проверяем до записи, чтобы при ошибке ничего не менялось
   let reminderList: string[] | null = null;
   if (body.reminders !== undefined) {
@@ -2114,10 +2204,10 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
   const assignedByCommittee = isCommittee(user) && (task.for_all === 1 || assigneeId !== user.id) ? 1 : 0;
   await env.DB.prepare(
     `UPDATE tasks SET title = ?, description = ?, due_date = ?, importance = ?, assignee_id = ?,
-       assigned_by_committee = ?, attachment_id = ?, attachment_name = ?
+       assigned_by_committee = ?, attachment_id = ?, attachment_name = ?, needs_confirm = ?, confirm_condition = ?
      WHERE id = ?`,
   )
-    .bind(title, description, dueDate, importance, assigneeId, assignedByCommittee, attachmentId, attachmentLabel, id)
+    .bind(title, description, dueDate, importance, assigneeId, assignedByCommittee, attachmentId, attachmentLabel, needsConfirm, confirmCondition, id)
     .run();
 
   if (newViewers) {
@@ -2176,12 +2266,27 @@ async function setTaskStatus(request: Request, env: Env, id: number): Promise<Re
     }
     return json({ task: await loadTaskOut(env, id, user.id) });
   }
-  if (!isTaskParty(user, task)) return json({ error: "Закрыть задачу может исполнитель или создатель" }, 403);
+  const confirmer = canConfirm(user, task);
+  const needs = requiresConfirm(task);
+  let next: string;
+  if (!done) {
+    if (!isTaskParty(user, task) && !confirmer) return json({ error: "Нет доступа" }, 403);
+    next = "open";
+  } else if (confirmer) {
+    next = "done";
+  } else if (isExecutorOf(user, task)) {
+    next = needs ? "waiting" : "done";
+  } else if (task.creator_id === user.id && !needs) {
+    next = "done";
+  } else {
+    return json({ error: "Отметить выполнение может исполнитель, а подтвердить — проверяющий" }, 403);
+  }
   await env.DB.prepare("UPDATE tasks SET status = ?, done_at = ? WHERE id = ?")
-    .bind(done ? "done" : "open", done ? new Date().toISOString() : null, id)
+    .bind(next, next === "done" ? new Date().toISOString() : null, id)
     .run();
+  if (next === "waiting" && task.status !== "waiting") await notifyConfirmers(env, task, user.id);
   // Задача, которую назначил комсостав, выполнена — уведомляем весь комсостав
-  if (done && task.status !== "done" && task.assigned_by_committee === 1) {
+  if (next === "done" && task.status !== "done" && task.assigned_by_committee === 1) {
     const committeeIds = (
       await env.DB.prepare(
         `SELECT id FROM users WHERE status = 'approved' AND role IN (${COMMITTEE.map(() => "?").join(",")}) AND id <> ?`,
@@ -2258,6 +2363,7 @@ async function addSubtask(request: Request, env: Env, taskId: number): Promise<R
   )
     .bind(taskId, title, taskId)
     .run();
+  await syncSubtaskStatus(env, taskId);
   await recordHistory(env, taskId, user.id, [{ f: "subtask_add", from: null, to: title }]);
   return json({ task: await loadTaskOut(env, taskId, user.id) }, 201);
 }
@@ -2290,6 +2396,7 @@ async function updateSubtask(request: Request, env: Env, subId: number): Promise
   }
   if (body.done !== undefined) {
     await env.DB.prepare("UPDATE task_subtasks SET done = ? WHERE id = ?").bind(body.done === true ? 1 : 0, subId).run();
+    await syncSubtaskStatus(env, parent.taskId);
   }
   return json({ task: await loadTaskOut(env, parent.taskId, user.id) });
 }
@@ -2302,6 +2409,7 @@ async function deleteSubtask(request: Request, env: Env, subId: number): Promise
   if (isLocked(parent.task)) return json({ error: "Выполненную задачу нельзя редактировать" }, 403);
   const prev = await env.DB.prepare("SELECT title FROM task_subtasks WHERE id = ?").bind(subId).first<{ title: string }>();
   await env.DB.prepare("DELETE FROM task_subtasks WHERE id = ?").bind(subId).run();
+  await syncSubtaskStatus(env, parent.taskId);
   if (prev) await recordHistory(env, parent.taskId, user.id, [{ f: "subtask_remove", from: prev.title, to: null }]);
   return json({ task: await loadTaskOut(env, parent.taskId, user.id) });
 }

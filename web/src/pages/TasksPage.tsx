@@ -25,7 +25,9 @@ export interface Task {
   for_all: number;
   done_count: number;
   members_total: number;
-  viewers: { user_id: number; can_edit: number; name: string }[];
+  viewers: { user_id: number; can_edit: number; is_executor: number; name: string }[];
+  needs_confirm: number;
+  confirm_condition: string | null;
   reminders: string[];
   subtasks: { id: number; title: string; done: number }[];
 }
@@ -94,12 +96,13 @@ interface Comment {
   author_name: string;
 }
 
-type Scope = "mine" | "assigned" | "all";
+type Scope = "mine" | "assigned" | "available" | "all";
 type View = "list" | "board" | "calendar";
 
 const SCOPES: [Scope, string][] = [
   ["mine", "Мне"],
   ["assigned", "Я назначил"],
+  ["available", "Доступные мне"],
   ["all", "Все"],
 ];
 const VIEWS: [View, string][] = [
@@ -285,7 +288,15 @@ function TaskDetail({
   const [showHistory, setShowHistory] = useState(false);
   const [err, setErr] = useState("");
   const isCreator = task.creator_id === viewer.id;
-  const isAssignee = task.assignee_id === viewer.id;
+  // Исполнители — видящие, отмеченные как исполнитель
+  const executors = task.viewers.filter((v) => v.is_executor === 1);
+  const isAssignee = task.assignee_id === viewer.id || executors.some((v) => v.user_id === viewer.id);
+  const committeeViewer = COMMITTEE_ROLES.includes(viewer.role);
+  const needsCheck = task.for_all !== 1 && (task.needs_confirm === 1 || task.assigned_by_committee === 1 || executors.length > 1);
+  // Подтверждает: при нескольких исполнителях — создатель, иначе — комсостав (для задач комсостава и с галочкой)
+  const confirmer =
+    executors.length > 1 ? isCreator : (task.assigned_by_committee === 1 || task.needs_confirm === 1) && committeeViewer;
+  const markDone = task.status === "open" || (task.status === "waiting" && confirmer);
   // Выполненную задачу нельзя редактировать (у «Весь отряд» — когда выполнили все)
   const locked = task.for_all === 1 ? task.members_total > 0 && task.done_count >= task.members_total : task.status === "done";
   // Видящий с правом редактирования работает с задачей наравне с создателем
@@ -377,10 +388,17 @@ function TaskDetail({
       )}
       <div style={{ marginTop: 8, fontSize: 14, color: colors.blue }}>
         <Stars value={task.importance} />
-        <div style={{ marginTop: 6 }}>Исполнитель: {task.for_all === 1 ? "Весь отряд" : task.assignee_name}</div>
+        <div style={{ marginTop: 6 }}>
+          Исполнители: {task.for_all === 1 ? "Весь отряд" : executors.length ? executors.map((v) => v.name).join(", ") : task.assignee_name}
+        </div>
+        {task.needs_confirm === 1 && (
+          <div style={{ marginTop: 4, fontSize: 14 }}>
+            Подтверждение выполнения{task.confirm_condition ? `: ${task.confirm_condition}` : ""}
+          </div>
+        )}
         {task.viewers.length > 0 && (
           <div style={{ marginTop: 4, fontSize: 14 }}>
-            Видят: {task.viewers.map((v) => `${v.name}${v.can_edit ? " (редактирует)" : ""}`).join(", ")}
+            Видят: {task.viewers.map((v) => `${v.name}${v.is_executor ? " (исп.)" : ""}${v.can_edit ? " (редактирует)" : ""}`).join(", ")}
           </div>
         )}
         {task.for_all === 1 && isCreator && (
@@ -418,9 +436,15 @@ function TaskDetail({
       )}
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
-        {(isAssignee || isCreator || task.for_all === 1) && (
-          <button type="button" style={{ ...button, width: "auto", padding: "8px 14px", fontSize: 14 }} onClick={() => setDone(task.status !== "done")}>
-            {task.status === "done" ? "Вернуть в работу" : "Отметить выполненной"}
+        {(isAssignee || isCreator || editor || confirmer || task.for_all === 1) && (
+          <button type="button" style={{ ...button, width: "auto", padding: "8px 14px", fontSize: 14 }} onClick={() => setDone(markDone)}>
+            {markDone
+              ? task.status === "waiting"
+                ? "Подтвердить выполнение"
+                : needsCheck
+                  ? "Отправить на подтверждение"
+                  : "Отметить выполненной"
+              : "Вернуть в работу"}
           </button>
         )}
         {(isCreator || editor) && (
@@ -488,9 +512,10 @@ function TaskDetail({
   );
 }
 
+type ViewerDraft = { level: "view" | "edit"; exec: boolean };
+
 function TaskForm({
   viewer,
-  members,
   people,
   committee,
   initial,
@@ -498,7 +523,6 @@ function TaskForm({
   onCancel,
 }: {
   viewer: User;
-  members: Member[];
   people: Member[];
   committee: boolean;
   initial: Task | null;
@@ -509,21 +533,24 @@ function TaskForm({
   const [description, setDescription] = useState(initial?.description ?? "");
   const [dueDate, setDueDate] = useState(initial?.due_date ?? "");
   const [importance, setImportance] = useState(initial?.importance ?? 3);
-  const [assignee, setAssignee] = useState<string>(initial ? (initial.for_all === 1 ? "all" : String(initial.assignee_id)) : String(viewer.id));
+  const [assignee, setAssignee] = useState<string>(initial?.for_all === 1 ? "all" : String(viewer.id));
+  const [needsConfirm, setNeedsConfirm] = useState(initial?.needs_confirm === 1);
+  const [confirmCondition, setConfirmCondition] = useState(initial?.confirm_condition ?? "");
   const [reminders, setReminders] = useState<string[]>(initial ? initial.reminders.map((r) => toLocalInput(r)) : []);
   // undefined — файл не трогали; null — файл убрали; строка — новый файл
   const [attachmentId, setAttachmentId] = useState<string | null | undefined>(undefined);
   const [attachmentLabel, setAttachmentLabel] = useState<string | null>(initial?.attachment_name ?? null);
-  // Кому, кроме создателя и исполнителя, видна задача: "view" — только видит, "edit" — может редактировать
-  const [viewers, setViewers] = useState<Record<number, "view" | "edit">>(() =>
-    Object.fromEntries((initial?.viewers ?? []).map((v) => [v.user_id, v.can_edit ? "edit" : "view"])),
+  // Кому видна задача: level — только видит или может редактировать; exec — исполнитель (только из видящих)
+  const [viewers, setViewers] = useState<Record<number, ViewerDraft>>(() =>
+    Object.fromEntries(
+      (initial?.viewers ?? []).map((v) => [v.user_id, { level: v.can_edit ? "edit" : "view", exec: v.is_executor === 1 }]),
+    ),
   );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
   const canSetViewers = !initial || initial.creator_id === viewer.id;
-  const assigneeId = assignee === "all" ? null : Number(assignee);
-  const viewerChoices = people.filter((p) => p.id !== viewer.id && p.id !== assigneeId);
+  const viewerChoices = people.filter((p) => p.id !== viewer.id);
 
   async function pickFile(file: File) {
     if (file.size > MAX_FILE) {
@@ -564,9 +591,17 @@ function TaskForm({
       importance,
       reminders: newReminders,
     };
-    if (committee) payload.assignee_id = assignee === "all" ? "all" : Number(assignee);
+    if (committee) {
+      payload.assignee_id = assignee === "all" ? "all" : viewer.id;
+      payload.needs_confirm = needsConfirm;
+      payload.confirm_condition = needsConfirm ? confirmCondition.trim() : "";
+    }
     if (canSetViewers)
-      payload.viewers = Object.entries(viewers).map(([id, level]) => ({ user_id: Number(id), can_edit: level === "edit" }));
+      payload.viewers = Object.entries(viewers).map(([id, d]) => ({
+        user_id: Number(id),
+        can_edit: d.level === "edit",
+        is_executor: committee && assignee !== "all" && d.exec,
+      }));
     if (attachmentId !== undefined) payload.attachment_id = attachmentId ?? "";
     setBusy(true);
     setErr("");
@@ -617,16 +652,30 @@ function TaskForm({
           >
             <option value={String(viewer.id)}>Я</option>
             {committee && <option value="all">Весь отряд</option>}
-            {committee &&
-              members
-                .filter((m) => m.id !== viewer.id)
-                .map((m) => (
-                  <option key={m.id} value={String(m.id)}>
-                    {m.full_name}
-                  </option>
-                ))}
           </select>
         </label>
+        {committee && assignee !== "all" && (
+          <div style={{ marginBottom: 12, fontSize: 14, color: "#5F7385" }}>
+            Исполнители — отметьте людей ниже (только из тех, кто видит задачу). Если никого не отметить, исполнитель — вы.
+          </div>
+        )}
+        {committee && (
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <input type="checkbox" checked={needsConfirm} onChange={(e) => setNeedsConfirm(e.target.checked)} />
+              Подтверждать выполнение
+            </label>
+            {needsConfirm && (
+              <input
+                style={input}
+                placeholder="Условие подтверждения, например: фото отчёта в чате"
+                value={confirmCondition}
+                onChange={(e) => setConfirmCondition(e.target.value)}
+                maxLength={500}
+              />
+            )}
+          </div>
+        )}
         {canSetViewers && (
           <fieldset style={{ border: "none", padding: 0, margin: "0 0 12px" }}>
             <legend style={{ padding: 0 }}>Кто ещё видит задачу</legend>
@@ -642,7 +691,7 @@ function TaskForm({
                       onChange={(e) =>
                         setViewers((cur) => {
                           const next = { ...cur };
-                          if (e.target.checked) next[p.id] = "view";
+                          if (e.target.checked) next[p.id] = { level: "view", exec: false };
                           else delete next[p.id];
                           return next;
                         })
@@ -653,12 +702,24 @@ function TaskForm({
                   {level !== undefined && (
                     <select
                       style={{ ...input, width: "auto", marginBottom: 0 }}
-                      value={level}
-                      onChange={(e) => setViewers((cur) => ({ ...cur, [p.id]: e.target.value as "view" | "edit" }))}
+                      value={level.level}
+                      onChange={(e) =>
+                        setViewers((cur) => ({ ...cur, [p.id]: { ...level, level: e.target.value as "view" | "edit" } }))
+                      }
                     >
                       <option value="view">Только видит</option>
                       <option value="edit">Может редактировать</option>
                     </select>
+                  )}
+                  {level !== undefined && committee && assignee !== "all" && (
+                    <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input
+                        type="checkbox"
+                        checked={level.exec}
+                        onChange={(e) => setViewers((cur) => ({ ...cur, [p.id]: { ...level, exec: e.target.checked } }))}
+                      />
+                      Исполняет
+                    </label>
                   )}
                 </div>
               );
@@ -819,7 +880,6 @@ function Calendar({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: number) => vo
 
 export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () => void }) {
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [members, setMembers] = useState<Member[]>([]);
   const [people, setPeople] = useState<Member[]>([]);
   const [scope, setScope] = useState<Scope>("mine");
   const [view, setView] = useState<View>("list");
@@ -847,13 +907,6 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
         if (status === 200) setPeople(data.users ?? []);
       })
       .catch(() => undefined);
-    if (committee) {
-      request("/api/admin/members")
-        .then(({ status, data }) => {
-          if (status === 200) setMembers(data.members ?? []);
-        })
-        .catch(() => undefined);
-    }
   }, []);
 
   // Любое изменение: перечитываем список и обновляем значок в меню
@@ -864,7 +917,10 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
 
   const shown = useMemo(() => {
     if (scope === "mine")
-      return tasks.filter((t) => t.assignee_id === viewer.id || t.for_all === 1 || t.viewers.some((v) => v.user_id === viewer.id));
+      return tasks.filter(
+        (t) => t.assignee_id === viewer.id || t.for_all === 1 || t.viewers.some((v) => v.user_id === viewer.id && v.is_executor === 1),
+      );
+    if (scope === "available") return tasks.filter((t) => t.viewers.some((v) => v.user_id === viewer.id));
     if (scope === "assigned") return tasks.filter((t) => t.creator_id === viewer.id);
     return tasks;
   }, [tasks, scope, viewer.id]);
@@ -967,7 +1023,6 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
       {(creating || editing) && (
         <TaskForm
           viewer={viewer}
-          members={members}
           people={people}
           committee={committee}
           initial={editing}
