@@ -29,7 +29,7 @@ export interface Task {
   needs_confirm: number;
   confirm_condition: string | null;
   reminders: string[];
-  subtasks: { id: number; title: string; done: number }[];
+  subtasks: { id: number; title: string; done: number; importance: number; assignee_id: number | null; assignee_name: string | null }[];
 }
 
 interface Member {
@@ -285,6 +285,11 @@ function TaskDetail({
   const [commentText, setCommentText] = useState("");
   const [reminders, setReminders] = useState<string[]>(task.reminders.map((r) => toLocalInput(r)));
   const [newSub, setNewSub] = useState("");
+  const [newSubImp, setNewSubImp] = useState(3);
+  const [newSubAssignee, setNewSubAssignee] = useState("");
+  const [subsLocal, setSubsLocal] = useState(task.subtasks);
+  const [showAllSubs, setShowAllSubs] = useState(false);
+  useEffect(() => setSubsLocal(task.subtasks), [task]);
   const [showHistory, setShowHistory] = useState(false);
   const [err, setErr] = useState("");
   const isCreator = task.creator_id === viewer.id;
@@ -297,6 +302,14 @@ function TaskDetail({
   const confirmer =
     executors.length > 1 ? isCreator : (task.assigned_by_committee === 1 || task.needs_confirm === 1) && committeeViewer;
   const markDone = task.status === "open" || (task.status === "waiting" && confirmer);
+  // Кого можно назначить на пункт: только те, кто добавлен в задачу (и создатель)
+  const assignable = [
+    { id: task.creator_id, name: task.creator_name },
+    ...task.viewers.filter((v) => v.user_id !== task.creator_id).map((v) => ({ id: v.user_id, name: v.name })),
+  ];
+  // Пункты: сначала важные; больше пяти — свёрнуты
+  const sortedSubs = [...subsLocal].sort((x, y) => y.importance - x.importance);
+  const shownSubs = showAllSubs || sortedSubs.length <= 5 ? sortedSubs : sortedSubs.slice(0, 5);
   // Выполненную задачу нельзя редактировать (у «Весь отряд» — когда выполнили все)
   const locked = task.for_all === 1 ? task.members_total > 0 && task.done_count >= task.members_total : task.status === "done";
   // Видящий с правом редактирования работает с задачей наравне с создателем
@@ -333,23 +346,34 @@ function TaskDetail({
     e.preventDefault();
     const text = newSub.trim();
     if (!text) return;
-    const { status, data } = await request(`/api/tasks/${task.id}/subtasks`, "POST", { title: text });
+    const { status, data } = await request(`/api/tasks/${task.id}/subtasks`, "POST", {
+      title: text,
+      importance: newSubImp,
+      assignee_id: newSubAssignee ? Number(newSubAssignee) : null,
+    });
     if (status === 201) {
+      setSubsLocal(data.task.subtasks);
       setNewSub("");
+      setNewSubImp(3);
+      setNewSubAssignee("");
       onChanged();
     } else setErr(data.error ?? "Не удалось добавить пункт");
   }
 
-  async function toggleSub(id: number, done: boolean) {
-    const { status, data } = await request(`/api/subtasks/${id}`, "PUT", { done });
-    if (status === 200) onChanged();
-    else setErr(data.error ?? "Не удалось изменить пункт");
+  async function setSubField(id: number, patch: { done?: boolean; importance?: number; assignee_id?: number | null }) {
+    const { status, data } = await request(`/api/subtasks/${id}`, "PUT", patch);
+    if (status === 200) {
+      setSubsLocal(data.task.subtasks);
+      onChanged();
+    } else setErr(data.error ?? "Не удалось изменить пункт");
   }
 
   async function removeSub(id: number) {
     const { status, data } = await request(`/api/subtasks/${id}`, "DELETE");
-    if (status === 200) onChanged();
-    else setErr(data.error ?? "Не удалось удалить пункт");
+    if (status === 200) {
+      setSubsLocal(data.task.subtasks);
+      onChanged();
+    } else setErr(data.error ?? "Не удалось удалить пункт");
   }
 
   async function sendComment(e: FormEvent) {
@@ -468,13 +492,42 @@ function TaskDetail({
       {showHistory && <HistoryModal taskId={task.id} onClose={() => setShowHistory(false)} />}
 
       <h4 style={{ margin: "18px 0 8px" }}>Подпункты</h4>
-      {task.subtasks.length === 0 && <p style={{ color: colors.gray, fontSize: 14, margin: "0 0 6px" }}>Пунктов нет.</p>}
-      {task.subtasks.map((sub) => (
-        <div key={sub.id} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-          <input type="checkbox" checked={!!sub.done} disabled={!canEditSub} onChange={(e) => toggleSub(sub.id, e.target.checked)} />
-          <span style={{ flex: 1, overflowWrap: "anywhere", textDecoration: sub.done ? "line-through" : "none", color: sub.done ? colors.gray : colors.white }}>
+      {subsLocal.length === 0 && <p style={{ color: colors.gray, fontSize: 14, margin: "0 0 6px" }}>Пунктов нет.</p>}
+      {shownSubs.map((sub) => (
+        <div key={sub.id} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+          <input
+            type="checkbox"
+            checked={!!sub.done}
+            disabled={locked || !(canEditSub || sub.assignee_id === viewer.id)}
+            onChange={(e) => setSubField(sub.id, { done: e.target.checked })}
+          />
+          <span
+            style={{
+              flex: 1,
+              minWidth: 0,
+              overflowWrap: "anywhere",
+              textDecoration: sub.done ? "line-through" : "none",
+              color: sub.done ? colors.gray : colors.white,
+            }}
+          >
             {sub.title}
+            {sub.assignee_name && <span style={{ fontSize: 12, color: colors.gray }}> · {sub.assignee_name}</span>}
           </span>
+          <Stars value={sub.importance} onChange={canEditSub ? (n) => setSubField(sub.id, { importance: n }) : undefined} />
+          {canEditSub && (
+            <select
+              style={{ ...input, width: "auto", margin: 0, padding: "2px 4px", fontSize: 13 }}
+              value={sub.assignee_id ?? ""}
+              onChange={(e) => setSubField(sub.id, { assignee_id: e.target.value ? Number(e.target.value) : null })}
+            >
+              <option value="">без исполнителя</option>
+              {assignable.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          )}
           {canEditSub && (
             <button type="button" onClick={() => removeSub(sub.id)} aria-label="Удалить пункт" style={linkButton}>
               ✕
@@ -482,9 +535,23 @@ function TaskDetail({
           )}
         </div>
       ))}
+      {sortedSubs.length > 5 && (
+        <button type="button" onClick={() => setShowAllSubs((v) => !v)} style={{ ...linkButton, marginBottom: 6 }}>
+          {showAllSubs ? "Свернуть" : `Развернуть все (${sortedSubs.length})`}
+        </button>
+      )}
       {canEditSub && (
-        <form onSubmit={addSub} style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-          <input style={{ ...input, margin: 0 }} value={newSub} onChange={(e) => setNewSub(e.target.value)} placeholder="Новый пункт..." maxLength={200} />
+        <form onSubmit={addSub} style={{ display: "flex", gap: 8, marginBottom: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <input style={{ ...input, margin: 0, flex: 1, minWidth: 160 }} value={newSub} onChange={(e) => setNewSub(e.target.value)} placeholder="Новый пункт..." maxLength={200} />
+          <Stars value={newSubImp} onChange={setNewSubImp} />
+          <select style={{ ...input, width: "auto", margin: 0 }} value={newSubAssignee} onChange={(e) => setNewSubAssignee(e.target.value)}>
+            <option value="">без исполнителя</option>
+            {assignable.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
           <button type="submit" style={{ ...button, width: "auto", padding: "8px 14px" }}>
             Добавить
           </button>

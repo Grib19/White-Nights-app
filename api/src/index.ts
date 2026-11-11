@@ -1674,6 +1674,18 @@ interface SubtaskRow {
   task_id?: number;
   title: string;
   done: number;
+  importance: number;
+  assignee_id: number | null;
+  assignee_name: string | null;
+}
+
+// Подпункт может получить исполнителя только из тех, кто видит задачу
+function cleanAssignee(task: TaskRow, raw: unknown): number | null | "bad" {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const uid = Number(raw);
+  if (!Number.isInteger(uid) || uid <= 0) return "bad";
+  const allowed = uid === task.creator_id || uid === task.assignee_id || parseViewers(task.viewers_json).some((v) => v.user_id === uid);
+  return allowed ? uid : "bad";
 }
 
 const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importance, t.creator_id, cu.full_name AS creator_name,
@@ -1775,7 +1787,14 @@ function shapeTask(row: TaskRow, subtasks: SubtaskRow[]) {
     ...rest,
     reminders,
     viewers: parseViewers(viewers_json).map((v) => ({ user_id: v.user_id, can_edit: v.can_edit, is_executor: v.is_executor ?? 0, name: v.name ?? "" })),
-    subtasks: subtasks.map((s) => ({ id: s.id, title: s.title, done: s.done })),
+    subtasks: subtasks.map((s) => ({
+      id: s.id,
+      title: s.title,
+      done: s.done,
+      importance: s.importance ?? 3,
+      assignee_id: s.assignee_id ?? null,
+      assignee_name: s.assignee_name ?? null,
+    })),
   };
 }
 
@@ -1783,7 +1802,11 @@ async function loadTaskOut(env: Env, id: number, viewerId: number) {
   const row = await taskById(env, id, viewerId);
   if (!row) return null;
   const subs = (
-    await env.DB.prepare("SELECT id, title, done FROM task_subtasks WHERE task_id = ? ORDER BY position, id")
+    await env.DB.prepare(
+      `SELECT s.id, s.title, s.done, s.importance, s.assignee_id, u.full_name AS assignee_name
+         FROM task_subtasks s LEFT JOIN users u ON u.id = s.assignee_id
+        WHERE s.task_id = ? ORDER BY s.importance DESC, s.position, s.id`,
+    )
       .bind(id)
       .all<SubtaskRow>()
   ).results;
@@ -1941,7 +1964,11 @@ async function listTasks(request: Request, env: Env): Promise<Response> {
       .all<TaskRow>()
   ).results;
   const subs = (
-    await env.DB.prepare("SELECT id, task_id, title, done FROM task_subtasks ORDER BY position, id").all<SubtaskRow>()
+    await env.DB.prepare(
+      `SELECT s.id, s.task_id, s.title, s.done, s.importance, s.assignee_id, u.full_name AS assignee_name
+         FROM task_subtasks s LEFT JOIN users u ON u.id = s.assignee_id
+        ORDER BY s.importance DESC, s.position, s.id`,
+    ).all<SubtaskRow>()
   ).results;
   const byTask = new Map<number, SubtaskRow[]>();
   for (const s of subs) byTask.set(s.task_id ?? 0, [...(byTask.get(s.task_id ?? 0) ?? []), s]);
@@ -2371,33 +2398,44 @@ async function addSubtask(request: Request, env: Env, taskId: number): Promise<R
   const body = await readJson(request);
   const title = str(body.title, TASK_SUBTASK_MAX);
   if (!title) return json({ error: "Напишите пункт" }, 400);
+  const assigneeId = cleanAssignee(task, body.assignee_id);
+  if (assigneeId === "bad") return json({ error: "Исполнитель пункта — из тех, кто добавлен в задачу" }, 400);
   await env.DB.prepare(
-    "INSERT INTO task_subtasks (task_id, title, position) VALUES (?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM task_subtasks WHERE task_id = ?))",
+    "INSERT INTO task_subtasks (task_id, title, position, importance, assignee_id) VALUES (?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM task_subtasks WHERE task_id = ?), ?, ?)",
   )
-    .bind(taskId, title, taskId)
+    .bind(taskId, title, taskId, cleanImportance(body.importance, 3), assigneeId)
     .run();
+  if (assigneeId && assigneeId !== user.id) await notifyUsers(env, [assigneeId]);
   await syncSubtaskStatus(env, taskId);
   await recordHistory(env, taskId, user.id, [{ f: "subtask_add", from: null, to: title }]);
   return json({ task: await loadTaskOut(env, taskId, user.id) }, 201);
 }
 
-async function subtaskParent(env: Env, user: UserRow, subId: number): Promise<{ taskId: number; task: TaskRow } | null> {
-  const sub = await env.DB.prepare("SELECT task_id FROM task_subtasks WHERE id = ?")
+async function subtaskParent(
+  env: Env,
+  user: UserRow,
+  subId: number,
+  forDone = false,
+): Promise<{ taskId: number; task: TaskRow; assigneeId: number | null } | null> {
+  const sub = await env.DB.prepare("SELECT task_id, assignee_id FROM task_subtasks WHERE id = ?")
     .bind(subId)
-    .first<{ task_id: number }>();
+    .first<{ task_id: number; assignee_id: number | null }>();
   if (!sub) return null;
   const task = await taskById(env, sub.task_id, user.id);
-  if (!task || !canSeeTask(user, task) || !isTaskParty(user, task)) return null;
-  return { taskId: sub.task_id, task };
+  if (!task || !canSeeTask(user, task)) return null;
+  // Отметить пункт может и его исполнитель, даже если он не исполняет задачу
+  if (!isTaskParty(user, task) && !(forDone && sub.assignee_id === user.id)) return null;
+  return { taskId: sub.task_id, task, assigneeId: sub.assignee_id };
 }
 
 async function updateSubtask(request: Request, env: Env, subId: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
-  const parent = await subtaskParent(env, user, subId);
+  const body = await readJson(request);
+  const onlyDone = body.done !== undefined && body.title === undefined && body.importance === undefined && body.assignee_id === undefined;
+  const parent = await subtaskParent(env, user, subId, onlyDone);
   if (!parent) return json({ error: "Не найдено" }, 404);
   if (isLocked(parent.task)) return json({ error: "Выполненную задачу нельзя редактировать" }, 403);
-  const body = await readJson(request);
   if (body.title !== undefined) {
     const title = str(body.title, TASK_SUBTASK_MAX);
     if (!title) return json({ error: "Напишите пункт" }, 400);
@@ -2406,6 +2444,15 @@ async function updateSubtask(request: Request, env: Env, subId: number): Promise
     if (prev && prev.title !== title) {
       await recordHistory(env, parent.taskId, user.id, [{ f: "subtask_rename", from: prev.title, to: title }]);
     }
+  }
+  if (body.importance !== undefined) {
+    await env.DB.prepare("UPDATE task_subtasks SET importance = ? WHERE id = ?").bind(cleanImportance(body.importance, 3), subId).run();
+  }
+  if (body.assignee_id !== undefined) {
+    const assigneeId = cleanAssignee(parent.task, body.assignee_id);
+    if (assigneeId === "bad") return json({ error: "Исполнитель пункта — из тех, кто добавлен в задачу" }, 400);
+    await env.DB.prepare("UPDATE task_subtasks SET assignee_id = ? WHERE id = ?").bind(assigneeId, subId).run();
+    if (assigneeId && assigneeId !== parent.assigneeId && assigneeId !== user.id) await notifyUsers(env, [assigneeId]);
   }
   if (body.done !== undefined) {
     await env.DB.prepare("UPDATE task_subtasks SET done = ? WHERE id = ?").bind(body.done === true ? 1 : 0, subId).run();
