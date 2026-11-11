@@ -1658,6 +1658,7 @@ interface TaskRow {
   status: string;
   done_at: string | null;
   created_at: string;
+  edited_at: string | null;
   comments_count: number;
   reminders_raw: string | null;
 }
@@ -1671,7 +1672,7 @@ interface SubtaskRow {
 
 const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importance, t.creator_id, cu.full_name AS creator_name,
   t.assignee_id, au.full_name AS assignee_name, t.assigned_by_committee, t.attachment_id, t.attachment_name,
-  t.status, t.done_at, t.created_at,
+  t.status, t.done_at, t.created_at, t.edited_at,
   (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS comments_count,
   (SELECT group_concat(r.remind_at, '|') FROM task_reminders r WHERE r.task_id = t.id) AS reminders_raw
   FROM tasks t JOIN users cu ON cu.id = t.creator_id JOIN users au ON au.id = t.assignee_id`;
@@ -1785,22 +1786,47 @@ async function sendDueReminders(env: Env): Promise<void> {
 }
 
 // Заменяет напоминания задачи. Новые моменты не должны быть в прошлом; уже существующие не трогаем.
-async function replaceReminders(env: Env, taskId: number, list: string[]): Promise<string | null> {
+type HistoryChange = { f: string; from: string | null; to: string | null };
+
+// Запись в историю и отметка «Редактировано»
+async function recordHistory(env: Env, taskId: number, userId: number, changes: HistoryChange[]): Promise<void> {
+  if (changes.length === 0) return;
+  const now = new Date().toISOString();
+  await env.DB.prepare("INSERT INTO task_history (task_id, user_id, changes, created_at) VALUES (?, ?, ?, ?)")
+    .bind(taskId, userId, JSON.stringify(changes), now)
+    .run();
+  await env.DB.prepare("UPDATE tasks SET edited_at = ? WHERE id = ?").bind(now, taskId).run();
+}
+
+async function userName(env: Env, id: number): Promise<string> {
+  const u = await env.DB.prepare("SELECT full_name FROM users WHERE id = ?").bind(id).first<{ full_name: string }>();
+  return u?.full_name ?? "";
+}
+
+// Проверяет новые напоминания: прошлое время для уже существующих не считаем новым
+async function checkNewReminders(env: Env, taskId: number, list: string[]): Promise<string | null> {
+  const known = new Set(
+    (await env.DB.prepare("SELECT remind_at FROM task_reminders WHERE task_id = ?").bind(taskId).all<{ remind_at: string }>())
+      .results.map((r) => r.remind_at),
+  );
+  const now = new Date().toISOString();
+  return list.some((iso) => !known.has(iso) && iso <= now) ? "Напоминание не может быть в прошлом" : null;
+}
+
+// Заменяет напоминания задачи (проверку делает вызывающий код до записи)
+async function replaceReminders(env: Env, taskId: number, list: string[]): Promise<void> {
   const existing = (
     await env.DB.prepare("SELECT id, remind_at FROM task_reminders WHERE task_id = ?")
       .bind(taskId)
       .all<{ id: number; remind_at: string }>()
   ).results;
   const known = new Set(existing.map((e) => e.remind_at));
-  const now = new Date().toISOString();
-  if (list.some((iso) => !known.has(iso) && iso <= now)) return "Напоминание не может быть в прошлом";
   for (const e of existing) {
     if (!list.includes(e.remind_at)) await env.DB.prepare("DELETE FROM task_reminders WHERE id = ?").bind(e.id).run();
   }
   for (const iso of list) {
     if (!known.has(iso)) await env.DB.prepare("INSERT INTO task_reminders (task_id, remind_at) VALUES (?, ?)").bind(taskId, iso).run();
   }
-  return null;
 }
 
 async function listTasks(request: Request, env: Env): Promise<Response> {
@@ -1932,6 +1958,23 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
       }
     }
   }
+  // Новые напоминания проверяем до записи, чтобы при ошибке ничего не менялось
+  let reminderList: string[] | null = null;
+  if (body.reminders !== undefined) {
+    reminderList = parseReminders(body.reminders);
+    if (!reminderList) return json({ error: "Неверный формат напоминаний" }, 400);
+    const err = await checkNewReminders(env, id, reminderList);
+    if (err) return json({ error: err }, 400);
+  }
+
+  const changes: HistoryChange[] = [];
+  if (title !== task.title) changes.push({ f: "title", from: task.title, to: title });
+  if (description !== task.description) changes.push({ f: "description", from: null, to: null });
+  if (dueDate !== task.due_date) changes.push({ f: "due_date", from: task.due_date, to: dueDate });
+  if (importance !== task.importance) changes.push({ f: "importance", from: String(task.importance), to: String(importance) });
+  if (assigneeId !== task.assignee_id) changes.push({ f: "assignee", from: task.assignee_name, to: await userName(env, assigneeId) });
+  if (attachmentId !== task.attachment_id) changes.push({ f: "attachment", from: task.attachment_name, to: attachmentLabel });
+
   const assignedByCommittee = isCommittee(user) && assigneeId !== user.id ? 1 : 0;
   await env.DB.prepare(
     `UPDATE tasks SET title = ?, description = ?, due_date = ?, importance = ?, assignee_id = ?,
@@ -1941,14 +1984,35 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
     .bind(title, description, dueDate, importance, assigneeId, assignedByCommittee, attachmentId, attachmentLabel, id)
     .run();
 
-  if (body.reminders !== undefined) {
-    const list = parseReminders(body.reminders);
-    if (!list) return json({ error: "Неверный формат напоминаний" }, 400);
-    const err = await replaceReminders(env, id, list);
-    if (err) return json({ error: err }, 400);
+  if (reminderList) {
+    const oldRem = (
+      await env.DB.prepare("SELECT remind_at FROM task_reminders WHERE task_id = ?").bind(id).all<{ remind_at: string }>()
+    ).results.map((r) => r.remind_at);
+    for (const iso of reminderList) if (!oldRem.includes(iso)) changes.push({ f: "reminder_add", from: null, to: iso });
+    for (const iso of oldRem) if (!reminderList.includes(iso)) changes.push({ f: "reminder_remove", from: iso, to: null });
+    await replaceReminders(env, id, reminderList);
   }
+  await recordHistory(env, id, user.id, changes);
   if (assigneeId !== task.assignee_id) await notifyUsers(env, [assigneeId]);
   return json({ task: await loadTaskOut(env, id) });
+}
+
+async function listTaskHistory(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, id);
+  if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
+  const rows = (
+    await env.DB.prepare(
+      `SELECT h.id, h.changes, h.created_at, u.full_name AS user_name FROM task_history h
+       JOIN users u ON u.id = h.user_id WHERE h.task_id = ? ORDER BY h.id DESC LIMIT 200`,
+    )
+      .bind(id)
+      .all<{ id: number; changes: string; created_at: string; user_name: string }>()
+  ).results;
+  return json({
+    history: rows.map((r) => ({ id: r.id, created_at: r.created_at, user_name: r.user_name, changes: JSON.parse(r.changes) as HistoryChange[] })),
+  });
 }
 
 async function setTaskStatus(request: Request, env: Env, id: number): Promise<Response> {
@@ -1985,6 +2049,7 @@ async function deleteTask(request: Request, env: Env, id: number): Promise<Respo
   await env.DB.prepare("DELETE FROM task_reminders WHERE task_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM task_subtasks WHERE task_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM task_comments WHERE task_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM task_history WHERE task_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM tasks WHERE id = ?").bind(id).run();
   if (task.attachment_id) await env.FILES.delete(`att:${task.attachment_id}`);
   return json({ ok: true });
@@ -2037,6 +2102,7 @@ async function addSubtask(request: Request, env: Env, taskId: number): Promise<R
   )
     .bind(taskId, title, taskId)
     .run();
+  await recordHistory(env, taskId, user.id, [{ f: "subtask_add", from: null, to: title }]);
   return json({ task: await loadTaskOut(env, taskId) }, 201);
 }
 
@@ -2059,7 +2125,11 @@ async function updateSubtask(request: Request, env: Env, subId: number): Promise
   if (body.title !== undefined) {
     const title = str(body.title, TASK_SUBTASK_MAX);
     if (!title) return json({ error: "Напишите пункт" }, 400);
+    const prev = await env.DB.prepare("SELECT title FROM task_subtasks WHERE id = ?").bind(subId).first<{ title: string }>();
     await env.DB.prepare("UPDATE task_subtasks SET title = ? WHERE id = ?").bind(title, subId).run();
+    if (prev && prev.title !== title) {
+      await recordHistory(env, parent.taskId, user.id, [{ f: "subtask_rename", from: prev.title, to: title }]);
+    }
   }
   if (body.done !== undefined) {
     await env.DB.prepare("UPDATE task_subtasks SET done = ? WHERE id = ?").bind(body.done === true ? 1 : 0, subId).run();
@@ -2072,7 +2142,9 @@ async function deleteSubtask(request: Request, env: Env, subId: number): Promise
   if (!user) return json({ error: "Нужен вход" }, 401);
   const parent = await subtaskParent(env, user, subId);
   if (!parent) return json({ error: "Не найдено" }, 404);
+  const prev = await env.DB.prepare("SELECT title FROM task_subtasks WHERE id = ?").bind(subId).first<{ title: string }>();
   await env.DB.prepare("DELETE FROM task_subtasks WHERE id = ?").bind(subId).run();
+  if (prev) await recordHistory(env, parent.taskId, user.id, [{ f: "subtask_remove", from: prev.title, to: null }]);
   return json({ task: await loadTaskOut(env, parent.taskId) });
 }
 
@@ -2299,6 +2371,8 @@ export default {
       const taskCommentsMatch = path.match(/^\/api\/tasks\/(\d+)\/comments$/);
       if (taskCommentsMatch && method === "GET") return await listTaskComments(request, env, Number(taskCommentsMatch[1]));
       if (taskCommentsMatch && method === "POST") return await addTaskComment(request, env, Number(taskCommentsMatch[1]));
+      const taskHistoryMatch = path.match(/^\/api\/tasks\/(\d+)\/history$/);
+      if (taskHistoryMatch && method === "GET") return await listTaskHistory(request, env, Number(taskHistoryMatch[1]));
       const taskSubtasksMatch = path.match(/^\/api\/tasks\/(\d+)\/subtasks$/);
       if (taskSubtasksMatch && method === "POST") return await addSubtask(request, env, Number(taskSubtasksMatch[1]));
       const subtaskMatch = path.match(/^\/api\/subtasks\/(\d+)$/);

@@ -20,6 +20,7 @@ export interface Task {
   status: string;
   done_at: string | null;
   created_at: string;
+  edited_at: string | null;
   comments_count: number;
   reminders: string[];
   subtasks: { id: number; title: string; done: number }[];
@@ -29,6 +30,48 @@ interface Member {
   id: number;
   full_name: string;
   role: string;
+}
+
+interface HistoryChange {
+  f: string;
+  from: string | null;
+  to: string | null;
+}
+
+interface HistoryEntry {
+  id: number;
+  created_at: string;
+  user_name: string;
+  changes: HistoryChange[];
+}
+
+function describeChange(c: HistoryChange): string {
+  switch (c.f) {
+    case "title":
+      return `Название: «${c.from}» → «${c.to}»`;
+    case "description":
+      return "Описание изменено";
+    case "due_date":
+      return `Срок: ${c.from ? formatDate(c.from) : "без срока"} → ${c.to ? formatDate(c.to) : "без срока"}`;
+    case "importance":
+      return `Важность: ${c.from} → ${c.to}`;
+    case "assignee":
+      return `Исполнитель: ${c.from} → ${c.to}`;
+    case "attachment":
+      return c.to ? `Файл: ${c.to}` : "Файл удалён";
+    case "reminder_add":
+      return `Напоминание добавлено: ${formatWhen(c.to ?? "")}`;
+    case "reminder_remove":
+      return `Напоминание удалено: ${formatWhen(c.from ?? "")}`;
+    case "subtask_add":
+      return `Пункт добавлен: «${c.to}»`;
+    case "subtask_rename":
+      return `Пункт переименован: «${c.from}» → «${c.to}»`;
+    case "subtask_remove":
+      return `Пункт удалён: «${c.from}»`;
+    default:
+      return "Изменено";
+  }
 }
 
 interface Comment {
@@ -152,8 +195,47 @@ function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: number) => void }
         {task.reminders.length ? ` · напоминаний: ${task.reminders.length}` : ""}
         {task.subtasks.length ? ` · подпункты ${task.subtasks.filter((s) => s.done).length}/${task.subtasks.length}` : ""}
         {task.comments_count ? ` · комментариев: ${task.comments_count}` : ""}
+        {task.edited_at ? " · редактировано" : ""}
       </div>
     </div>
+  );
+}
+
+function HistoryModal({ taskId, onClose }: { taskId: number; onClose: () => void }) {
+  const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    request(`/api/tasks/${taskId}/history`)
+      .then(({ status, data }) => {
+        if (status === 200) setEntries(data.history ?? []);
+        else setErr(data.error ?? "Не удалось загрузить историю");
+      })
+      .catch(() => setErr("Нет связи с сервером"));
+  }, [taskId]);
+  return (
+    <Overlay onClose={onClose}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+        <h3 style={{ margin: 0 }}>История изменений</h3>
+        <button type="button" onClick={onClose} aria-label="Закрыть" style={linkButton}>
+          ✕
+        </button>
+      </div>
+      {err && <p style={{ color: "#ff8a8a" }}>{err}</p>}
+      {!entries && !err && <p style={{ color: colors.gray }}>Загрузка…</p>}
+      {entries && entries.length === 0 && <p style={{ color: colors.gray }}>Изменений пока нет.</p>}
+      {entries?.map((e) => (
+        <div key={e.id} style={{ borderLeft: `3px solid ${colors.blue}`, paddingLeft: 10, marginTop: 12 }}>
+          <div style={{ fontSize: 13, color: colors.blue }}>
+            {formatWhen(e.created_at)} · <b>{e.user_name}</b>
+          </div>
+          {e.changes.map((c, i) => (
+            <div key={i} style={{ fontSize: 14, overflowWrap: "anywhere" }}>
+              {describeChange(c)}
+            </div>
+          ))}
+        </div>
+      ))}
+    </Overlay>
   );
 }
 
@@ -176,6 +258,7 @@ function TaskDetail({
   const [commentText, setCommentText] = useState("");
   const [reminders, setReminders] = useState<string[]>(task.reminders.map((r) => toLocalInput(r)));
   const [newSub, setNewSub] = useState("");
+  const [showHistory, setShowHistory] = useState(false);
   const [err, setErr] = useState("");
   const isCreator = task.creator_id === viewer.id;
   const isAssignee = task.assignee_id === viewer.id;
@@ -255,6 +338,14 @@ function TaskDetail({
         <h3 style={{ margin: 0, overflowWrap: "anywhere", textDecoration: task.status === "done" ? "line-through" : "none" }}>{task.title}</h3>
         <button type="button" onClick={onClose} aria-label="Закрыть" style={linkButton}>✕</button>
       </div>
+      {task.edited_at && (
+        <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 13 }}>
+          <span style={{ background: colors.yellow, color: colors.navy, borderRadius: 999, padding: "1px 8px", fontWeight: "bold" }}>Редактировано</span>
+          <button type="button" onClick={() => setShowHistory(true)} style={linkButton}>
+            История изменений
+          </button>
+        </div>
+      )}
       <div style={{ marginTop: 8, fontSize: 14, color: colors.blue }}>
         <Stars value={task.importance} />
         <div style={{ marginTop: 6 }}>Исполнитель: {task.assignee_name}</div>
@@ -304,6 +395,8 @@ function TaskDetail({
           </>
         )}
       </div>
+
+      {showHistory && <HistoryModal taskId={task.id} onClose={() => setShowHistory(false)} />}
 
       <h4 style={{ margin: "18px 0 8px" }}>Подпункты</h4>
       {task.subtasks.length === 0 && <p style={{ color: colors.gray, fontSize: 14, margin: "0 0 6px" }}>Пунктов нет.</p>}
