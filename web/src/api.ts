@@ -145,14 +145,38 @@ export async function downloadAttachment(id: string, name: string): Promise<stri
 
 // Картинка с защищённого адреса: браузер сам не передаёт заголовок входа, поэтому грузим через fetch
 // Картинка из чата (вложение). Возвращает адрес для тега img.
-export async function loadAttachmentUrl(id: string): Promise<string | null> {
-  const res = await fetch(baseUrl() + `/api/attachments/${id}`, { headers: authHeaders() });
-  if (!res.ok) return null;
-  return URL.createObjectURL(await res.blob());
+// Кеш картинок в памяти: одна и та же картинка (аватар, фото в ленте) грузится с сервера один раз
+// за сессию, а не каждый раз, когда раздел открывается заново. Ошибки в кеш не попадают.
+const imageCache = new Map<string, Promise<string | null>>();
+
+function cachedImage(key: string, load: () => Promise<string | null>): Promise<string | null> {
+  const hit = imageCache.get(key);
+  if (hit) return hit;
+  const p = load().catch(() => null).then((url) => {
+    if (!url) imageCache.delete(key);
+    return url;
+  });
+  imageCache.set(key, p);
+  return p;
 }
 
-export async function loadImage(id: string): Promise<string | null> {
-  const res = await fetch(baseUrl() + `/api/files/${id}`, { headers: authHeaders() });
-  if (!res.ok) return null;
-  return URL.createObjectURL(await res.blob());
+// Вызывается при выходе, чтобы картинки прошлого пользователя не остались в памяти
+export function clearImageCache(): void {
+  imageCache.clear();
+}
+
+export function loadAttachmentUrl(id: string): Promise<string | null> {
+  return cachedImage(`att:${id}`, async () => {
+    const res = await fetch(baseUrl() + `/api/attachments/${id}`, { headers: authHeaders() });
+    if (!res.ok) return null;
+    return URL.createObjectURL(await res.blob());
+  });
+}
+
+export function loadImage(id: string): Promise<string | null> {
+  return cachedImage(`img:${id}`, async () => {
+    const res = await fetch(baseUrl() + `/api/files/${id}`, { headers: authHeaders() });
+    if (!res.ok) return null;
+    return URL.createObjectURL(await res.blob());
+  });
 }

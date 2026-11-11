@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
-import { COMMITTEE_ROLES, User, getToken, request, roleLabel, setToken } from "./api";
+import { COMMITTEE_ROLES, User, clearImageCache, getToken, request, roleLabel, setToken } from "./api";
 import { button, card, colors, input, page, tabButton, tabs } from "./styles";
 import { Logo } from "./Logo";
 import { ProfilePage } from "./pages/ProfilePage";
@@ -73,6 +73,7 @@ export function App() {
 
   async function logout() {
     await request("/api/logout", "POST").catch(() => undefined);
+    clearImageCache();
     setToken(null);
     setUser(null);
   }
