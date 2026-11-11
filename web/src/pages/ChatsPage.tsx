@@ -547,6 +547,9 @@ function ChatView({
   const fileRef = useRef<HTMLInputElement>(null);
   const [recording, setRecording] = useState(false);
   const [recSeconds, setRecSeconds] = useState(0);
+  const [levels, setLevels] = useState<number[]>([]);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const recCancelRef = useRef(false);
@@ -714,6 +717,25 @@ function ChatView({
     };
   }, []);
 
+  // Живая шкала громкости: видно, что микрофон действительно пишет звук
+  useEffect(() => {
+    if (!recording) return;
+    const id = window.setInterval(() => {
+      const analyser = analyserRef.current;
+      if (!analyser) return;
+      const data = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const x = (data[i] - 128) / 128;
+        sum += x * x;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      setLevels((prev) => [...prev.slice(-29), Math.min(1, rms * 4)]);
+    }, 100);
+    return () => window.clearInterval(id);
+  }, [recording]);
+
   async function startRecording() {
     if (busy || recording) return;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
@@ -731,10 +753,22 @@ function ChatView({
       };
       rec.onstop = () => {
         stream.getTracks().forEach((t) => t.stop());
+        void audioCtxRef.current?.close();
+        audioCtxRef.current = null;
+        analyserRef.current = null;
         const blob = new Blob(chunksRef.current, { type: rec.mimeType || mime || "audio/webm" });
         chunksRef.current = [];
         if (!recCancelRef.current && blob.size > 0) sendVoice(blob);
       };
+      const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const ctx = new Ctx();
+      void ctx.resume().catch(() => undefined);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      audioCtxRef.current = ctx;
+      analyserRef.current = analyser;
+      setLevels([]);
       recorderRef.current = rec;
       setRecSeconds(0);
       setErr("");
@@ -1216,9 +1250,14 @@ function ChatView({
                 <button type="button" onClick={() => finishRecording(false)} aria-label="Отменить запись" style={{ ...composerIconButton, fontSize: 18 }}>
                   ✕
                 </button>
-                <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, color: "#ff8a8a", fontSize: 15 }}>
-                  <span style={{ width: 10, height: 10, borderRadius: 5, background: "#ff5c5c" }} />
-                  {formatDuration(recSeconds)}
+                <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 2, height: 28, overflow: "hidden" }}>
+                    {Array.from({ length: 30 }, (_, i) => {
+                      const v = levels[levels.length - 30 + i] ?? 0.08;
+                      return <span key={i} style={{ flex: 1, height: `${Math.max(8, Math.round(v * 100))}%`, minHeight: 3, borderRadius: 2, background: colors.blue }} />;
+                    })}
+                  </div>
+                  <span style={{ fontSize: 15, color: colors.white, flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{formatDuration(recSeconds)}</span>
                 </div>
                 <button type="button" onClick={() => finishRecording(true)} aria-label="Отправить голосовое" style={composerIconButton}>
                   <SendIcon />
@@ -1395,15 +1434,145 @@ function AttachmentImage({ id, name }: { id: string; name: string }) {
   return <img src={src} alt={name} style={{ display: "block", maxWidth: 260, maxHeight: 260, borderRadius: 8, marginBottom: 4 }} />;
 }
 
+const VOICE_BARS = 36;
+
+// Высоты полосок по звуковой волне: делим запись на отрезки и берём максимум громкости в каждом
+function computePeaks(data: Float32Array, count: number): number[] {
+  const step = Math.max(1, Math.floor(data.length / count));
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    let max = 0;
+    for (let j = i * step; j < Math.min((i + 1) * step, data.length); j++) max = Math.max(max, Math.abs(data[j]));
+    out.push(max);
+  }
+  const top = Math.max(...out, 0.05);
+  return out.map((v) => Math.max(0.12, Math.min(1, v / top)));
+}
+
+function PlayGlyph() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M8 5v14l11-7z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function PauseGlyph() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="6" y="5" width="4" height="14" fill="currentColor" />
+      <rect x="14" y="5" width="4" height="14" fill="currentColor" />
+    </svg>
+  );
+}
+
 function AudioMessage({ id }: { id: string }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [peaks, setPeaks] = useState<number[]>([]);
+  const [duration, setDuration] = useState(0);
+  const [current, setCurrent] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const audioRef = useRef<HTMLAudioElement>(null);
+
   useEffect(() => {
-    loadAttachmentUrl(id).then((u) => (u ? setSrc(u) : setFailed(true)));
+    let alive = true;
+    loadAttachmentUrl(id).then(async (u) => {
+      if (!alive) return;
+      if (!u) {
+        setFailed(true);
+        return;
+      }
+      setSrc(u);
+      // Декодируем запись: так узнаём точную длительность и строим волну (у записей браузера длительность в плеере часто не известна)
+      try {
+        const buf = await (await fetch(u)).arrayBuffer();
+        const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const ctx = new Ctx();
+        const decoded = await ctx.decodeAudioData(buf);
+        void ctx.close();
+        if (!alive) return;
+        setDuration(decoded.duration);
+        setPeaks(computePeaks(decoded.getChannelData(0), VOICE_BARS));
+      } catch {
+        // Волну построить не удалось: покажем ровную полоску, проигрывание работает и без неё
+      }
+    });
+    return () => {
+      alive = false;
+    };
   }, [id]);
+
+  function toggle(e: { stopPropagation: () => void }) {
+    e.stopPropagation();
+    const a = audioRef.current;
+    if (!a) return;
+    if (a.paused) void a.play().catch(() => undefined);
+    else a.pause();
+  }
+
+  function seek(e: { currentTarget: HTMLDivElement; clientX: number; stopPropagation: () => void }) {
+    e.stopPropagation();
+    const a = audioRef.current;
+    if (!a || !duration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const share = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    a.currentTime = share * duration;
+    setCurrent(a.currentTime);
+  }
+
   if (failed) return <div style={{ fontSize: 13, color: colors.gray }}>Не удалось загрузить голосовое</div>;
   if (!src) return <div style={{ fontSize: 13, color: colors.gray }}>Загрузка голосового…</div>;
-  return <audio controls preload="metadata" src={src} style={{ display: "block", maxWidth: "100%", marginBottom: 4 }} />;
+
+  const bars = peaks.length ? peaks : Array.from({ length: VOICE_BARS }, () => 0.25);
+  const progress = duration > 0 ? current / duration : 0;
+  const shownTime = playing || current > 0 ? current : duration;
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, width: 260, maxWidth: "100%", padding: "2px 0 4px" }}>
+      <audio
+        ref={audioRef}
+        src={src}
+        preload="auto"
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => {
+          setPlaying(false);
+          setCurrent(0);
+        }}
+        onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
+        onLoadedMetadata={(e) => {
+          const d = e.currentTarget.duration;
+          if (isFinite(d)) setDuration((prev) => prev || d);
+        }}
+      />
+      <button
+        type="button"
+        onClick={toggle}
+        aria-label={playing ? "Пауза" : "Слушать голосовое"}
+        style={{ width: 40, height: 40, borderRadius: 20, border: "none", background: colors.blue, color: colors.navy, cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}
+      >
+        {playing ? <PauseGlyph /> : <PlayGlyph />}
+      </button>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div onClick={seek} style={{ display: "flex", alignItems: "center", gap: 2, height: 28, cursor: "pointer" }}>
+          {bars.map((h, i) => (
+            <span
+              key={i}
+              style={{
+                flex: 1,
+                height: `${Math.round(h * 100)}%`,
+                minHeight: 3,
+                borderRadius: 2,
+                background: i / bars.length < progress ? colors.blue : "rgba(148,192,217,0.35)",
+              }}
+            />
+          ))}
+        </div>
+        <div style={{ fontSize: 12, color: colors.gray, marginTop: 2, fontVariantNumeric: "tabular-nums" }}>{formatDuration(Math.floor(shownTime))}</div>
+      </div>
+    </div>
+  );
 }
 
 function NewChatPanel({
