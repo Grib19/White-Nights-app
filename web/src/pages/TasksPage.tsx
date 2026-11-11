@@ -19,9 +19,10 @@ export interface Task {
   attachment_name: string | null;
   status: string;
   done_at: string | null;
-  remind_at: string | null;
   created_at: string;
   comments_count: number;
+  reminders: string[];
+  subtasks: { id: number; title: string; done: number }[];
 }
 
 interface Member {
@@ -148,7 +149,8 @@ function TaskCard({ task, onOpen }: { task: Task; onOpen: (id: number) => void }
       </div>
       <div style={{ fontSize: 13, marginTop: 4, color: overdue ? "#ff8a8a" : colors.blue }}>
         {task.due_date ? `Срок: ${formatDate(task.due_date)}${overdue ? " · просрочено" : ""}` : "Без срока"}
-        {task.remind_at ? ` · напоминание ${formatWhen(task.remind_at)}` : ""}
+        {task.reminders.length ? ` · напоминаний: ${task.reminders.length}` : ""}
+        {task.subtasks.length ? ` · подпункты ${task.subtasks.filter((s) => s.done).length}/${task.subtasks.length}` : ""}
         {task.comments_count ? ` · комментариев: ${task.comments_count}` : ""}
       </div>
     </div>
@@ -172,10 +174,12 @@ function TaskDetail({
 }) {
   const [comments, setComments] = useState<Comment[]>([]);
   const [commentText, setCommentText] = useState("");
-  const [remind, setRemind] = useState(toLocalInput(task.remind_at));
+  const [reminders, setReminders] = useState<string[]>(task.reminders.map((r) => toLocalInput(r)));
+  const [newSub, setNewSub] = useState("");
   const [err, setErr] = useState("");
   const isCreator = task.creator_id === viewer.id;
   const isAssignee = task.assignee_id === viewer.id;
+  const canEditSub = isCreator || isAssignee;
 
   async function loadComments() {
     const { status, data } = await request(`/api/tasks/${task.id}/comments`);
@@ -185,7 +189,7 @@ function TaskDetail({
   useEffect(() => {
     loadComments();
     // Открыли другую задачу — обновляем поле напоминания
-    setRemind(toLocalInput(task.remind_at));
+    setReminders(task.reminders.map((r) => toLocalInput(r)));
   }, [task.id]);
 
   async function setDone(done: boolean) {
@@ -195,11 +199,35 @@ function TaskDetail({
     else setErr(data.error ?? "Не удалось изменить статус");
   }
 
-  async function saveRemind(value: string | null) {
+  async function saveReminders() {
     setErr("");
-    const { status, data } = await request(`/api/tasks/${task.id}`, "PUT", { remind_at: value });
+    const list = reminders.filter((v) => v).map((v) => fromLocalInput(v)).filter((v): v is string => !!v);
+    const { status, data } = await request(`/api/tasks/${task.id}`, "PUT", { reminders: list });
     if (status === 200) onChanged();
-    else setErr(data.error ?? "Не удалось сохранить напоминание");
+    else setErr(data.error ?? "Не удалось сохранить напоминания");
+  }
+
+  async function addSub(e: FormEvent) {
+    e.preventDefault();
+    const text = newSub.trim();
+    if (!text) return;
+    const { status, data } = await request(`/api/tasks/${task.id}/subtasks`, "POST", { title: text });
+    if (status === 201) {
+      setNewSub("");
+      onChanged();
+    } else setErr(data.error ?? "Не удалось добавить пункт");
+  }
+
+  async function toggleSub(id: number, done: boolean) {
+    const { status, data } = await request(`/api/subtasks/${id}`, "PUT", { done });
+    if (status === 200) onChanged();
+    else setErr(data.error ?? "Не удалось изменить пункт");
+  }
+
+  async function removeSub(id: number) {
+    const { status, data } = await request(`/api/subtasks/${id}`, "DELETE");
+    if (status === 200) onChanged();
+    else setErr(data.error ?? "Не удалось удалить пункт");
   }
 
   async function sendComment(e: FormEvent) {
@@ -252,20 +280,10 @@ function TaskDetail({
 
       {(isAssignee || isCreator) && (
         <div style={{ marginTop: 12 }}>
-          <label style={{ display: "block", fontSize: 14 }}>
-            Напоминание
-            <input style={input} type="datetime-local" value={remind} onChange={(e) => setRemind(e.target.value)} />
-          </label>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button type="button" style={{ ...button, width: "auto", padding: "8px 14px", fontSize: 14 }} onClick={() => saveRemind(fromLocalInput(remind))}>
-              Сохранить напоминание
-            </button>
-            {task.remind_at && (
-              <button type="button" style={{ ...tabButton(false), padding: "8px 14px" }} onClick={() => saveRemind(null)}>
-                Убрать
-              </button>
-            )}
-          </div>
+          <RemindersEditor values={reminders} onChange={setReminders} />
+          <button type="button" style={{ ...button, width: "auto", padding: "8px 14px", fontSize: 14 }} onClick={saveReminders}>
+            Сохранить напоминания
+          </button>
         </div>
       )}
 
@@ -286,6 +304,30 @@ function TaskDetail({
           </>
         )}
       </div>
+
+      <h4 style={{ margin: "18px 0 8px" }}>Подпункты</h4>
+      {task.subtasks.length === 0 && <p style={{ color: colors.gray, fontSize: 14, margin: "0 0 6px" }}>Пунктов нет.</p>}
+      {task.subtasks.map((sub) => (
+        <div key={sub.id} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <input type="checkbox" checked={!!sub.done} disabled={!canEditSub} onChange={(e) => toggleSub(sub.id, e.target.checked)} />
+          <span style={{ flex: 1, overflowWrap: "anywhere", textDecoration: sub.done ? "line-through" : "none", color: sub.done ? colors.gray : colors.white }}>
+            {sub.title}
+          </span>
+          {canEditSub && (
+            <button type="button" onClick={() => removeSub(sub.id)} aria-label="Удалить пункт" style={linkButton}>
+              ✕
+            </button>
+          )}
+        </div>
+      ))}
+      {canEditSub && (
+        <form onSubmit={addSub} style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+          <input style={{ ...input, margin: 0 }} value={newSub} onChange={(e) => setNewSub(e.target.value)} placeholder="Новый пункт..." maxLength={200} />
+          <button type="submit" style={{ ...button, width: "auto", padding: "8px 14px" }}>
+            Добавить
+          </button>
+        </form>
+      )}
 
       <h4 style={{ margin: "18px 0 8px" }}>Комментарии</h4>
       {comments.length === 0 && <p style={{ color: colors.gray, fontSize: 14, margin: 0 }}>Пока нет комментариев.</p>}
@@ -328,7 +370,7 @@ function TaskForm({
   const [dueDate, setDueDate] = useState(initial?.due_date ?? "");
   const [importance, setImportance] = useState(initial?.importance ?? 3);
   const [assigneeId, setAssigneeId] = useState(initial?.assignee_id ?? viewer.id);
-  const [remindAt, setRemindAt] = useState(toLocalInput(initial?.remind_at ?? null));
+  const [reminders, setReminders] = useState<string[]>(initial ? initial.reminders.map((r) => toLocalInput(r)) : []);
   // undefined — файл не трогали; null — файл убрали; строка — новый файл
   const [attachmentId, setAttachmentId] = useState<string | null | undefined>(undefined);
   const [attachmentLabel, setAttachmentLabel] = useState<string | null>(initial?.attachment_name ?? null);
@@ -359,12 +401,21 @@ function TaskForm({
       setErr("Укажите название задачи");
       return;
     }
+    if (dueDate && dueDate < todayIso() && dueDate !== initial?.due_date) {
+      setErr("Срок не может быть в прошлом");
+      return;
+    }
+    const newReminders = reminders.filter((v) => v).map((v) => fromLocalInput(v)).filter((v): v is string => !!v);
+    if (newReminders.some((iso) => iso <= new Date().toISOString() && !initial?.reminders.includes(iso))) {
+      setErr("Напоминание не может быть в прошлом");
+      return;
+    }
     const payload: Record<string, unknown> = {
       title: title.trim(),
       description,
       due_date: dueDate || null,
       importance,
-      remind_at: fromLocalInput(remindAt),
+      reminders: newReminders,
     };
     if (committee) payload.assignee_id = assigneeId;
     if (attachmentId !== undefined) payload.attachment_id = attachmentId ?? "";
@@ -402,7 +453,7 @@ function TaskForm({
         </label>
         <label style={{ display: "block" }}>
           Срок
-          <input style={input} type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+          <input style={input} type="date" min={todayIso()} value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
         </label>
         <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
           Важность <Stars value={importance} onChange={setImportance} />
@@ -421,10 +472,7 @@ function TaskForm({
         ) : (
           <div style={{ fontSize: 14, color: colors.blue, marginBottom: 12 }}>Исполнитель: вы</div>
         )}
-        <label style={{ display: "block" }}>
-          Напоминание (дата и время)
-          <input style={input} type="datetime-local" value={remindAt} onChange={(e) => setRemindAt(e.target.value)} />
-        </label>
+        <RemindersEditor values={reminders} onChange={setReminders} />
         <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <input
             ref={fileRef}
@@ -467,6 +515,34 @@ function TaskForm({
   );
 }
 
+function RemindersEditor({ values, onChange }: { values: string[]; onChange: (v: string[]) => void }) {
+  const minLocal = toLocalInput(new Date().toISOString());
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 14, marginBottom: 4 }}>Напоминания</div>
+      {values.map((v, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+          <input
+            style={{ ...input, margin: 0 }}
+            type="datetime-local"
+            min={minLocal}
+            value={v}
+            onChange={(e) => onChange(values.map((x, j) => (j === i ? e.target.value : x)))}
+          />
+          <button type="button" onClick={() => onChange(values.filter((_, j) => j !== i))} style={linkButton}>
+            убрать
+          </button>
+        </div>
+      ))}
+      {values.length < 10 && (
+        <button type="button" onClick={() => onChange([...values, ""])} style={{ ...tabButton(false), padding: "6px 12px" }}>
+          + Добавить напоминание
+        </button>
+      )}
+    </div>
+  );
+}
+
 function Calendar({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: number) => void }) {
   const [month, setMonth] = useState(() => {
     const d = new Date();
@@ -478,14 +554,12 @@ function Calendar({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: number) => vo
   const daysInMonth = new Date(year, mon + 1, 0).getDate();
   const pad = (n: number) => String(n).padStart(2, "0");
   const byDay = new Map<string, Task[]>();
-  const noDate: Task[] = [];
   for (const t of tasks) {
-    if (!t.due_date) {
-      noDate.push(t);
-      continue;
-    }
+    if (!t.due_date) continue;
     byDay.set(t.due_date, [...(byDay.get(t.due_date) ?? []), t]);
   }
+  const monthPrefix = `${year}-${pad(mon + 1)}-`;
+  const outside = tasks.filter((t) => !t.due_date || !t.due_date.startsWith(monthPrefix));
   const cells: (number | null)[] = [...Array(firstDay).fill(null), ...Array.from({ length: daysInMonth }, (_, i) => i + 1)];
   while (cells.length % 7 !== 0) cells.push(null);
 
@@ -538,10 +612,10 @@ function Calendar({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: number) => vo
           );
         })}
       </div>
-      {noDate.length > 0 && (
+      {outside.length > 0 && (
         <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 14, color: colors.blue, marginBottom: 6 }}>Без срока ({noDate.length})</div>
-          {noDate.map((t) => (
+          <div style={{ fontSize: 14, color: colors.blue, marginBottom: 6 }}>Вне этого месяца и без срока ({outside.length})</div>
+          {outside.map((t) => (
             <TaskCard key={t.id} task={t} onOpen={onOpen} />
           ))}
         </div>
@@ -590,7 +664,7 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
 
   const shown = useMemo(() => {
     if (scope === "mine") return tasks.filter((t) => t.assignee_id === viewer.id);
-    if (scope === "assigned") return tasks.filter((t) => t.creator_id === viewer.id && t.assignee_id !== viewer.id);
+    if (scope === "assigned") return tasks.filter((t) => t.creator_id === viewer.id);
     return tasks;
   }, [tasks, scope, viewer.id]);
 

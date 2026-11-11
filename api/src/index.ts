@@ -1636,6 +1636,8 @@ async function leaveChat(request: Request, env: Env, chatId: number): Promise<Re
 const TASK_TITLE_MAX = 200;
 const TASK_DESC_MAX = 4000;
 const TASK_COMMENT_MAX = 1000;
+const TASK_SUBTASK_MAX = 200;
+const TASK_REMINDERS_MAX = 10;
 const TASK_LIMIT = 500;
 const REMIND_BATCH = 20; // напоминаний за одну минуту (бережём лимит подзапросов Workers)
 const API_ORIGIN = "https://white-nights-api.white-nights.workers.dev";
@@ -1655,16 +1657,23 @@ interface TaskRow {
   attachment_name: string | null;
   status: string;
   done_at: string | null;
-  remind_at: string | null;
   created_at: string;
   comments_count: number;
-  reminder_sent: number;
+  reminders_raw: string | null;
+}
+
+interface SubtaskRow {
+  id: number;
+  task_id?: number;
+  title: string;
+  done: number;
 }
 
 const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importance, t.creator_id, cu.full_name AS creator_name,
   t.assignee_id, au.full_name AS assignee_name, t.assigned_by_committee, t.attachment_id, t.attachment_name,
-  t.status, t.done_at, t.remind_at, t.created_at, t.reminder_sent,
-  (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS comments_count
+  t.status, t.done_at, t.created_at,
+  (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS comments_count,
+  (SELECT group_concat(r.remind_at, '|') FROM task_reminders r WHERE r.task_id = t.id) AS reminders_raw
   FROM tasks t JOIN users cu ON cu.id = t.creator_id JOIN users au ON au.id = t.assignee_id`;
 
 // Задачу видят: её создатель и исполнитель, а также весь комсостав — если задачу назначил комсостав
@@ -1672,13 +1681,46 @@ function canSeeTask(user: UserRow, t: { creator_id: number; assignee_id: number;
   return t.creator_id === user.id || t.assignee_id === user.id || (isCommittee(user) && t.assigned_by_committee === 1);
 }
 
+// Менять подпункты и закрывать задачу могут только создатель и исполнитель
+function isTaskParty(user: UserRow, t: { creator_id: number; assignee_id: number }): boolean {
+  return t.creator_id === user.id || t.assignee_id === user.id;
+}
+
 async function taskById(env: Env, id: number): Promise<TaskRow | null> {
   return env.DB.prepare(`${TASK_SELECT} WHERE t.id = ?`).bind(id).first<TaskRow>();
+}
+
+function shapeTask(row: TaskRow, subtasks: SubtaskRow[]) {
+  const { reminders_raw, ...rest } = row;
+  const reminders = reminders_raw ? reminders_raw.split("|").sort() : [];
+  return {
+    ...rest,
+    reminders,
+    subtasks: subtasks.map((s) => ({ id: s.id, title: s.title, done: s.done })),
+  };
+}
+
+async function loadTaskOut(env: Env, id: number) {
+  const row = await taskById(env, id);
+  if (!row) return null;
+  const subs = (
+    await env.DB.prepare("SELECT id, title, done FROM task_subtasks WHERE task_id = ? ORDER BY position, id")
+      .bind(id)
+      .all<SubtaskRow>()
+  ).results;
+  return shapeTask(row, subs);
 }
 
 function cleanDate(value: unknown): string | null {
   const s = str(value, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+// Самая ранняя допустимая дата срока: вчера по UTC (небольшой запас на часовой пояс)
+function minDueDate(): string {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
 }
 
 // Время напоминания приходит как ISO-строка с часовым поясом и хранится в UTC
@@ -1687,6 +1729,17 @@ function cleanRemind(value: unknown): string | null {
   if (!s) return null;
   const t = Date.parse(s);
   return Number.isNaN(t) ? null : new Date(t).toISOString();
+}
+
+// Список напоминаний из запроса: уникальные моменты времени, отсортированные
+function parseReminders(raw: unknown): string[] | null {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) return null;
+  const list = raw
+    .slice(0, TASK_REMINDERS_MAX)
+    .map((v) => cleanRemind(v))
+    .filter((v): v is string => v !== null);
+  return [...new Set(list)].sort();
 }
 
 function cleanImportance(value: unknown, fallback: number): number {
@@ -1718,16 +1771,36 @@ async function notifyUsers(env: Env, userIds: number[]): Promise<void> {
 async function sendDueReminders(env: Env): Promise<void> {
   const due = (
     await env.DB.prepare(
-      "SELECT id, assignee_id FROM tasks WHERE status = 'open' AND reminder_sent = 0 AND remind_at IS NOT NULL AND remind_at <= ? LIMIT ?",
+      `SELECT r.id, t.assignee_id, t.status FROM task_reminders r JOIN tasks t ON t.id = r.task_id
+       WHERE r.sent = 0 AND r.remind_at <= ? ORDER BY r.remind_at LIMIT ?`,
     )
       .bind(new Date().toISOString(), REMIND_BATCH)
-      .all<{ id: number; assignee_id: number }>()
+      .all<{ id: number; assignee_id: number; status: string }>()
   ).results;
-  for (const t of due) {
+  for (const r of due) {
     // Сначала отмечаем, чтобы при сбое напоминание не ушло дважды
-    await env.DB.prepare("UPDATE tasks SET reminder_sent = 1 WHERE id = ?").bind(t.id).run();
-    await notifyUsers(env, [t.assignee_id]);
+    await env.DB.prepare("UPDATE task_reminders SET sent = 1 WHERE id = ?").bind(r.id).run();
+    if (r.status === "open") await notifyUsers(env, [r.assignee_id]);
   }
+}
+
+// Заменяет напоминания задачи. Новые моменты не должны быть в прошлом; уже существующие не трогаем.
+async function replaceReminders(env: Env, taskId: number, list: string[]): Promise<string | null> {
+  const existing = (
+    await env.DB.prepare("SELECT id, remind_at FROM task_reminders WHERE task_id = ?")
+      .bind(taskId)
+      .all<{ id: number; remind_at: string }>()
+  ).results;
+  const known = new Set(existing.map((e) => e.remind_at));
+  const now = new Date().toISOString();
+  if (list.some((iso) => !known.has(iso) && iso <= now)) return "Напоминание не может быть в прошлом";
+  for (const e of existing) {
+    if (!list.includes(e.remind_at)) await env.DB.prepare("DELETE FROM task_reminders WHERE id = ?").bind(e.id).run();
+  }
+  for (const iso of list) {
+    if (!known.has(iso)) await env.DB.prepare("INSERT INTO task_reminders (task_id, remind_at) VALUES (?, ?)").bind(taskId, iso).run();
+  }
+  return null;
 }
 
 async function listTasks(request: Request, env: Env): Promise<Response> {
@@ -1741,7 +1814,12 @@ async function listTasks(request: Request, env: Env): Promise<Response> {
       .bind(user.id, user.id, isCommittee(user) ? 1 : 0, TASK_LIMIT)
       .all<TaskRow>()
   ).results;
-  return json({ tasks: rows.map(({ reminder_sent: _r, ...t }) => t), me: user.id });
+  const subs = (
+    await env.DB.prepare("SELECT id, task_id, title, done FROM task_subtasks ORDER BY position, id").all<SubtaskRow>()
+  ).results;
+  const byTask = new Map<number, SubtaskRow[]>();
+  for (const s of subs) byTask.set(s.task_id ?? 0, [...(byTask.get(s.task_id ?? 0) ?? []), s]);
+  return json({ tasks: rows.map((r) => shapeTask(r, byTask.get(r.id) ?? [])), me: user.id });
 }
 
 // Счётчик для значка в меню: открытые задачи, которые ждут самого пользователя
@@ -1770,6 +1848,13 @@ async function createTask(request: Request, env: Env): Promise<Response> {
     .first<{ id: number }>();
   if (!assignee) return json({ error: "Исполнитель не найден" }, 400);
 
+  const dueDate = cleanDate(body.due_date);
+  if (dueDate && dueDate < minDueDate()) return json({ error: "Срок не может быть в прошлом" }, 400);
+  const reminders = parseReminders(body.reminders);
+  if (!reminders) return json({ error: "Неверный формат напоминаний" }, 400);
+  const now = new Date().toISOString();
+  if (reminders.some((iso) => iso <= now)) return json({ error: "Напоминание не может быть в прошлом" }, 400);
+
   const attachmentId = str(body.attachment_id, 64) || null;
   let attName: string | null = null;
   if (attachmentId) {
@@ -1779,28 +1864,28 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   const assignedByCommittee = isCommittee(user) && assigneeId !== user.id ? 1 : 0;
   const result = await env.DB.prepare(
     `INSERT INTO tasks (title, description, due_date, importance, creator_id, assignee_id, assigned_by_committee,
-       attachment_id, attachment_name, remind_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       attachment_id, attachment_name)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       title,
       str(body.description, TASK_DESC_MAX),
-      cleanDate(body.due_date),
+      dueDate,
       cleanImportance(body.importance, 3),
       user.id,
       assigneeId,
       assignedByCommittee,
       attachmentId,
       attName,
-      cleanRemind(body.remind_at),
     )
     .run();
   const id = Number(result.meta.last_row_id);
+  await replaceReminders(env, id, reminders);
   if (assigneeId !== user.id) await notifyUsers(env, [assigneeId]);
-  return json({ task: await taskById(env, id) }, 201);
+  return json({ task: await loadTaskOut(env, id) }, 201);
 }
 
-// Создатель меняет всё, исполнитель — только время напоминания
+// Создатель меняет всё, исполнитель — только напоминания
 async function updateTask(request: Request, env: Env, id: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
@@ -1823,7 +1908,13 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
       if (!title) return json({ error: "Укажите название задачи" }, 400);
     }
     if (body.description !== undefined) description = str(body.description, TASK_DESC_MAX);
-    if (body.due_date !== undefined) dueDate = cleanDate(body.due_date);
+    if (body.due_date !== undefined) {
+      dueDate = cleanDate(body.due_date);
+      // Прошлый срок не ставим, но старую задачу с уже прошедшим сроком можно править
+      if (dueDate && dueDate !== task.due_date && dueDate < minDueDate()) {
+        return json({ error: "Срок не может быть в прошлом" }, 400);
+      }
+    }
     if (body.importance !== undefined) importance = cleanImportance(body.importance, importance);
     if (body.assignee_id !== undefined && Number(body.assignee_id) !== task.assignee_id) {
       if (!isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
@@ -1841,19 +1932,23 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
       }
     }
   }
-  const remindAt = body.remind_at !== undefined ? cleanRemind(body.remind_at) : task.remind_at;
   const assignedByCommittee = isCommittee(user) && assigneeId !== user.id ? 1 : 0;
-  // Новое время напоминания снова включает отправку
   await env.DB.prepare(
     `UPDATE tasks SET title = ?, description = ?, due_date = ?, importance = ?, assignee_id = ?,
-       assigned_by_committee = ?, attachment_id = ?, attachment_name = ?, remind_at = ?,
-       reminder_sent = CASE WHEN remind_at IS ? THEN reminder_sent ELSE 0 END
+       assigned_by_committee = ?, attachment_id = ?, attachment_name = ?
      WHERE id = ?`,
   )
-    .bind(title, description, dueDate, importance, assigneeId, assignedByCommittee, attachmentId, attachmentLabel, remindAt, remindAt, id)
+    .bind(title, description, dueDate, importance, assigneeId, assignedByCommittee, attachmentId, attachmentLabel, id)
     .run();
+
+  if (body.reminders !== undefined) {
+    const list = parseReminders(body.reminders);
+    if (!list) return json({ error: "Неверный формат напоминаний" }, 400);
+    const err = await replaceReminders(env, id, list);
+    if (err) return json({ error: err }, 400);
+  }
   if (assigneeId !== task.assignee_id) await notifyUsers(env, [assigneeId]);
-  return json({ task: await taskById(env, id) });
+  return json({ task: await loadTaskOut(env, id) });
 }
 
 async function setTaskStatus(request: Request, env: Env, id: number): Promise<Response> {
@@ -1861,9 +1956,7 @@ async function setTaskStatus(request: Request, env: Env, id: number): Promise<Re
   if (!user) return json({ error: "Нужен вход" }, 401);
   const task = await taskById(env, id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
-  if (task.assignee_id !== user.id && task.creator_id !== user.id) {
-    return json({ error: "Закрыть задачу может исполнитель или создатель" }, 403);
-  }
+  if (!isTaskParty(user, task)) return json({ error: "Закрыть задачу может исполнитель или создатель" }, 403);
   const body = await readJson(request);
   const done = body.done === true;
   await env.DB.prepare("UPDATE tasks SET status = ?, done_at = ? WHERE id = ?")
@@ -1880,7 +1973,7 @@ async function setTaskStatus(request: Request, env: Env, id: number): Promise<Re
     ).results.map((r) => r.id);
     await notifyUsers(env, committeeIds);
   }
-  return json({ task: await taskById(env, id) });
+  return json({ task: await loadTaskOut(env, id) });
 }
 
 async function deleteTask(request: Request, env: Env, id: number): Promise<Response> {
@@ -1889,6 +1982,9 @@ async function deleteTask(request: Request, env: Env, id: number): Promise<Respo
   const task = await taskById(env, id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
   if (task.creator_id !== user.id) return json({ error: "Удалить задачу может её создатель" }, 403);
+  await env.DB.prepare("DELETE FROM task_reminders WHERE task_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM task_subtasks WHERE task_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM task_comments WHERE task_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM tasks WHERE id = ?").bind(id).run();
   if (task.attachment_id) await env.FILES.delete(`att:${task.attachment_id}`);
   return json({ ok: true });
@@ -1925,6 +2021,59 @@ async function addTaskComment(request: Request, env: Env, id: number): Promise<R
   const other = user.id === task.creator_id ? task.assignee_id : task.creator_id;
   if (other !== user.id) await notifyUsers(env, [other]);
   return json({ ok: true }, 201);
+}
+
+// Подпункты: добавлять, отмечать и удалять могут создатель и исполнитель
+async function addSubtask(request: Request, env: Env, taskId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, taskId);
+  if (!task || !canSeeTask(user, task) || !isTaskParty(user, task)) return json({ error: "Не найдено" }, 404);
+  const body = await readJson(request);
+  const title = str(body.title, TASK_SUBTASK_MAX);
+  if (!title) return json({ error: "Напишите пункт" }, 400);
+  await env.DB.prepare(
+    "INSERT INTO task_subtasks (task_id, title, position) VALUES (?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM task_subtasks WHERE task_id = ?))",
+  )
+    .bind(taskId, title, taskId)
+    .run();
+  return json({ task: await loadTaskOut(env, taskId) }, 201);
+}
+
+async function subtaskParent(env: Env, user: UserRow, subId: number): Promise<{ taskId: number } | null> {
+  const sub = await env.DB.prepare("SELECT task_id FROM task_subtasks WHERE id = ?")
+    .bind(subId)
+    .first<{ task_id: number }>();
+  if (!sub) return null;
+  const task = await taskById(env, sub.task_id);
+  if (!task || !canSeeTask(user, task) || !isTaskParty(user, task)) return null;
+  return { taskId: sub.task_id };
+}
+
+async function updateSubtask(request: Request, env: Env, subId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const parent = await subtaskParent(env, user, subId);
+  if (!parent) return json({ error: "Не найдено" }, 404);
+  const body = await readJson(request);
+  if (body.title !== undefined) {
+    const title = str(body.title, TASK_SUBTASK_MAX);
+    if (!title) return json({ error: "Напишите пункт" }, 400);
+    await env.DB.prepare("UPDATE task_subtasks SET title = ? WHERE id = ?").bind(title, subId).run();
+  }
+  if (body.done !== undefined) {
+    await env.DB.prepare("UPDATE task_subtasks SET done = ? WHERE id = ?").bind(body.done === true ? 1 : 0, subId).run();
+  }
+  return json({ task: await loadTaskOut(env, parent.taskId) });
+}
+
+async function deleteSubtask(request: Request, env: Env, subId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const parent = await subtaskParent(env, user, subId);
+  if (!parent) return json({ error: "Не найдено" }, 404);
+  await env.DB.prepare("DELETE FROM task_subtasks WHERE id = ?").bind(subId).run();
+  return json({ task: await loadTaskOut(env, parent.taskId) });
 }
 
 // ---- Push-уведомления (Web Push с ключами VAPID). Текст сообщения в push не передаётся. ----
@@ -2150,6 +2299,11 @@ export default {
       const taskCommentsMatch = path.match(/^\/api\/tasks\/(\d+)\/comments$/);
       if (taskCommentsMatch && method === "GET") return await listTaskComments(request, env, Number(taskCommentsMatch[1]));
       if (taskCommentsMatch && method === "POST") return await addTaskComment(request, env, Number(taskCommentsMatch[1]));
+      const taskSubtasksMatch = path.match(/^\/api\/tasks\/(\d+)\/subtasks$/);
+      if (taskSubtasksMatch && method === "POST") return await addSubtask(request, env, Number(taskSubtasksMatch[1]));
+      const subtaskMatch = path.match(/^\/api\/subtasks\/(\d+)$/);
+      if (subtaskMatch && method === "PUT") return await updateSubtask(request, env, Number(subtaskMatch[1]));
+      if (subtaskMatch && method === "DELETE") return await deleteSubtask(request, env, Number(subtaskMatch[1]));
       const commentsMatch = path.match(/^\/api\/posts\/(\d+)\/comments$/);
       if (method === "GET" && commentsMatch) return await listComments(request, env, Number(commentsMatch[1]));
       if (method === "POST" && commentsMatch) return await addComment(request, env, Number(commentsMatch[1]));
