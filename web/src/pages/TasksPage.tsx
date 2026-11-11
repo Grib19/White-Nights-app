@@ -25,6 +25,7 @@ export interface Task {
   for_all: number;
   done_count: number;
   members_total: number;
+  viewers: { user_id: number; can_edit: number; name: string }[];
   reminders: string[];
   subtasks: { id: number; title: string; done: number }[];
 }
@@ -66,6 +67,8 @@ function changeView(c: HistoryChange): { label: string; before: string; after: s
       return { label: "Важность", before: `${c.from} из 5`, after: `${c.to} из 5` };
     case "assignee":
       return { label: "Исполнитель", before: c.from ?? dash, after: c.to ?? dash };
+    case "viewers":
+      return { label: "Видят", before: c.from ?? "никто", after: c.to ?? "никто" };
     case "attachment":
       return { label: "Файл", before: c.from ?? "нет", after: c.to ?? "нет" };
     case "reminder_add":
@@ -285,7 +288,9 @@ function TaskDetail({
   const isAssignee = task.assignee_id === viewer.id;
   // Выполненную задачу нельзя редактировать (у «Весь отряд» — когда выполнили все)
   const locked = task.for_all === 1 ? task.members_total > 0 && task.done_count >= task.members_total : task.status === "done";
-  const canEditSub = (isCreator || isAssignee) && !locked;
+  // Видящий с правом редактирования работает с задачей наравне с создателем
+  const editor = task.viewers.some((v) => v.user_id === viewer.id && v.can_edit === 1);
+  const canEditSub = (isCreator || isAssignee || editor) && !locked;
 
   async function loadComments() {
     const { status, data } = await request(`/api/tasks/${task.id}/comments`);
@@ -373,6 +378,11 @@ function TaskDetail({
       <div style={{ marginTop: 8, fontSize: 14, color: colors.blue }}>
         <Stars value={task.importance} />
         <div style={{ marginTop: 6 }}>Исполнитель: {task.for_all === 1 ? "Весь отряд" : task.assignee_name}</div>
+        {task.viewers.length > 0 && (
+          <div style={{ marginTop: 4, fontSize: 14 }}>
+            Видят: {task.viewers.map((v) => `${v.name}${v.can_edit ? " (редактирует)" : ""}`).join(", ")}
+          </div>
+        )}
         {task.for_all === 1 && isCreator && (
           <div>
             Выполнили: {task.done_count} из {task.members_total}
@@ -398,7 +408,7 @@ function TaskDetail({
         </button>
       )}
 
-      {(isAssignee || isCreator) && !locked && (
+      {(isAssignee || isCreator || editor) && !locked && (
         <div style={{ marginTop: 12 }}>
           <RemindersEditor values={reminders} onChange={setReminders} />
           <button type="button" style={{ ...button, width: "auto", padding: "8px 14px", fontSize: 14 }} onClick={saveReminders}>
@@ -413,13 +423,17 @@ function TaskDetail({
             {task.status === "done" ? "Вернуть в работу" : "Отметить выполненной"}
           </button>
         )}
-        {isCreator && (
+        {(isCreator || editor) && (
           <>
             {!locked && (
               <button type="button" style={{ ...tabButton(false), padding: "8px 14px" }} onClick={onEdit}>
                 Редактировать
               </button>
             )}
+          </>
+        )}
+        {isCreator && (
+          <>
             <button type="button" style={{ ...tabButton(false), padding: "8px 14px", color: "#b00020" }} onClick={remove}>
               Удалить
             </button>
@@ -477,6 +491,7 @@ function TaskDetail({
 function TaskForm({
   viewer,
   members,
+  people,
   committee,
   initial,
   onSaved,
@@ -484,6 +499,7 @@ function TaskForm({
 }: {
   viewer: User;
   members: Member[];
+  people: Member[];
   committee: boolean;
   initial: Task | null;
   onSaved: () => void;
@@ -498,9 +514,16 @@ function TaskForm({
   // undefined — файл не трогали; null — файл убрали; строка — новый файл
   const [attachmentId, setAttachmentId] = useState<string | null | undefined>(undefined);
   const [attachmentLabel, setAttachmentLabel] = useState<string | null>(initial?.attachment_name ?? null);
+  // Кому, кроме создателя и исполнителя, видна задача: "view" — только видит, "edit" — может редактировать
+  const [viewers, setViewers] = useState<Record<number, "view" | "edit">>(() =>
+    Object.fromEntries((initial?.viewers ?? []).map((v) => [v.user_id, v.can_edit ? "edit" : "view"])),
+  );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+  const canSetViewers = !initial || initial.creator_id === viewer.id;
+  const assigneeId = assignee === "all" ? null : Number(assignee);
+  const viewerChoices = people.filter((p) => p.id !== viewer.id && p.id !== assigneeId);
 
   async function pickFile(file: File) {
     if (file.size > MAX_FILE) {
@@ -542,6 +565,8 @@ function TaskForm({
       reminders: newReminders,
     };
     if (committee) payload.assignee_id = assignee === "all" ? "all" : Number(assignee);
+    if (canSetViewers)
+      payload.viewers = Object.entries(viewers).map(([id, level]) => ({ user_id: Number(id), can_edit: level === "edit" }));
     if (attachmentId !== undefined) payload.attachment_id = attachmentId ?? "";
     setBusy(true);
     setErr("");
@@ -602,6 +627,44 @@ function TaskForm({
                 ))}
           </select>
         </label>
+        {canSetViewers && (
+          <fieldset style={{ border: "none", padding: 0, margin: "0 0 12px" }}>
+            <legend style={{ padding: 0 }}>Кто ещё видит задачу</legend>
+            {viewerChoices.length === 0 && <div style={{ fontSize: 14, color: "#5F7385" }}>Нет других участников.</div>}
+            {viewerChoices.map((p) => {
+              const level = viewers[p.id];
+              return (
+                <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, flex: 1, minWidth: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={level !== undefined}
+                      onChange={(e) =>
+                        setViewers((cur) => {
+                          const next = { ...cur };
+                          if (e.target.checked) next[p.id] = "view";
+                          else delete next[p.id];
+                          return next;
+                        })
+                      }
+                    />
+                    {p.full_name}
+                  </label>
+                  {level !== undefined && (
+                    <select
+                      style={{ ...input, width: "auto", marginBottom: 0 }}
+                      value={level}
+                      onChange={(e) => setViewers((cur) => ({ ...cur, [p.id]: e.target.value as "view" | "edit" }))}
+                    >
+                      <option value="view">Только видит</option>
+                      <option value="edit">Может редактировать</option>
+                    </select>
+                  )}
+                </div>
+              );
+            })}
+          </fieldset>
+        )}
         <RemindersEditor values={reminders} onChange={setReminders} />
         <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <input
@@ -757,6 +820,7 @@ function Calendar({ tasks, onOpen }: { tasks: Task[]; onOpen: (id: number) => vo
 export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () => void }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
+  const [people, setPeople] = useState<Member[]>([]);
   const [scope, setScope] = useState<Scope>("mine");
   const [view, setView] = useState<View>("list");
   const [listTab, setListTab] = useState<"open" | "done">("open");
@@ -778,6 +842,11 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
 
   useEffect(() => {
     load();
+    request("/api/profiles")
+      .then(({ status, data }) => {
+        if (status === 200) setPeople(data.users ?? []);
+      })
+      .catch(() => undefined);
     if (committee) {
       request("/api/admin/members")
         .then(({ status, data }) => {
@@ -794,7 +863,8 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
   }
 
   const shown = useMemo(() => {
-    if (scope === "mine") return tasks.filter((t) => t.assignee_id === viewer.id || t.for_all === 1);
+    if (scope === "mine")
+      return tasks.filter((t) => t.assignee_id === viewer.id || t.for_all === 1 || t.viewers.some((v) => v.user_id === viewer.id));
     if (scope === "assigned") return tasks.filter((t) => t.creator_id === viewer.id);
     return tasks;
   }, [tasks, scope, viewer.id]);
@@ -898,6 +968,7 @@ export function TasksPage({ viewer, onChanged }: { viewer: User; onChanged: () =
         <TaskForm
           viewer={viewer}
           members={members}
+          people={people}
           committee={committee}
           initial={editing}
           onCancel={() => {

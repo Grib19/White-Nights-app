@@ -1664,6 +1664,7 @@ interface TaskRow {
   for_all: number;
   done_count: number;
   members_total: number;
+  viewers_json: string | null;
 }
 
 interface SubtaskRow {
@@ -1682,13 +1683,49 @@ const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importan
   (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS comments_count,
   (SELECT COUNT(*) FROM task_done d WHERE d.task_id = t.id) AS done_count,
   (SELECT COUNT(*) FROM users WHERE status = 'approved') AS members_total,
-  (SELECT group_concat(r.remind_at, '|') FROM task_reminders r WHERE r.task_id = t.id) AS reminders_raw
+  (SELECT group_concat(r.remind_at, '|') FROM task_reminders r WHERE r.task_id = t.id) AS reminders_raw,
+  (SELECT json_group_array(json_object('user_id', a.user_id, 'can_edit', a.can_edit, 'name', vu.full_name))
+     FROM task_access a JOIN users vu ON vu.id = a.user_id WHERE a.task_id = t.id) AS viewers_json
   FROM tasks t JOIN users cu ON cu.id = t.creator_id JOIN users au ON au.id = t.assignee_id`;
 
 // Задачу видят: её создатель и исполнитель, а также весь комсостав — если задачу назначил комсостав
-function canSeeTask(user: UserRow, t: { creator_id: number; assignee_id: number; assigned_by_committee: number; for_all?: number }): boolean {
+function canSeeTask(user: UserRow, t: TaskAccessFields): boolean {
   if (t.for_all === 1) return true;
-  return t.creator_id === user.id || t.assignee_id === user.id || (isCommittee(user) && t.assigned_by_committee === 1);
+  return (
+    t.creator_id === user.id ||
+    t.assignee_id === user.id ||
+    (isCommittee(user) && t.assigned_by_committee === 1) ||
+    viewerAccess(user, t) !== null
+  );
+}
+
+interface TaskAccessFields {
+  creator_id: number;
+  assignee_id: number;
+  assigned_by_committee: number;
+  for_all?: number;
+  viewers_json?: string | null;
+}
+
+interface ViewerItem {
+  user_id: number;
+  can_edit: number;
+  name?: string;
+}
+
+function parseViewers(raw: string | null | undefined): ViewerItem[] {
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw) as ViewerItem[];
+  } catch {
+    return [];
+  }
+}
+
+// null — задача не выделена пользователю; 1 — может редактировать; 0 — только видит
+function viewerAccess(user: UserRow, t: { viewers_json?: string | null }): number | null {
+  const found = parseViewers(t.viewers_json).find((v) => v.user_id === user.id);
+  return found ? found.can_edit : null;
 }
 
 // Менять подпункты и закрывать задачу могут только создатель и исполнитель
@@ -1698,8 +1735,9 @@ function isLocked(t: TaskRow): boolean {
   return t.status === "done";
 }
 
-function isTaskParty(user: UserRow, t: { creator_id: number; assignee_id: number }): boolean {
-  return t.creator_id === user.id || t.assignee_id === user.id;
+// Создатель, исполнитель и видящие с правом редактирования
+function isTaskParty(user: UserRow, t: TaskAccessFields): boolean {
+  return t.creator_id === user.id || t.assignee_id === user.id || viewerAccess(user, t) === 1;
 }
 
 async function taskById(env: Env, id: number, viewerId: number): Promise<TaskRow | null> {
@@ -1707,11 +1745,12 @@ async function taskById(env: Env, id: number, viewerId: number): Promise<TaskRow
 }
 
 function shapeTask(row: TaskRow, subtasks: SubtaskRow[]) {
-  const { reminders_raw, ...rest } = row;
+  const { reminders_raw, viewers_json, ...rest } = row;
   const reminders = reminders_raw ? reminders_raw.split("|").sort() : [];
   return {
     ...rest,
     reminders,
+    viewers: parseViewers(viewers_json).map((v) => ({ user_id: v.user_id, can_edit: v.can_edit, name: v.name ?? "" })),
     subtasks: subtasks.map((s) => ({ id: s.id, title: s.title, done: s.done })),
   };
 }
@@ -1870,10 +1909,11 @@ async function listTasks(request: Request, env: Env): Promise<Response> {
   const rows = (
     await env.DB.prepare(
       `${TASK_SELECT} WHERE t.creator_id = ? OR t.assignee_id = ? OR t.for_all = 1 OR (? = 1 AND t.assigned_by_committee = 1)
+         OR EXISTS (SELECT 1 FROM task_access a WHERE a.task_id = t.id AND a.user_id = ?)
        ORDER BY ((t.for_all = 1 AND EXISTS (SELECT 1 FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?)) OR (t.for_all = 0 AND t.status = 'done')),
          (t.due_date IS NULL), t.due_date, t.importance DESC, t.id DESC LIMIT ?`,
     )
-      .bind(user.id, user.id, user.id, user.id, isCommittee(user) ? 1 : 0, user.id, TASK_LIMIT)
+      .bind(user.id, user.id, user.id, user.id, isCommittee(user) ? 1 : 0, user.id, user.id, TASK_LIMIT)
       .all<TaskRow>()
   ).results;
   const subs = (
@@ -1895,6 +1935,33 @@ async function taskBadge(request: Request, env: Env): Promise<Response> {
     .bind(user.id, user.id)
     .first<{ open: number }>();
   return json({ open: row?.open ?? 0 });
+}
+
+// Список видящих: только одобренные пользователи, без создателя и исполнителя
+async function cleanViewers(env: Env, raw: unknown, skip: number[]): Promise<{ user_id: number; can_edit: number }[] | string> {
+  if (!Array.isArray(raw)) return "Неверный список видящих";
+  const picked = new Map<number, number>();
+  for (const item of raw.slice(0, 200)) {
+    const v = item as { user_id?: unknown; can_edit?: unknown } | null;
+    const uid = Number(v?.user_id);
+    if (!Number.isInteger(uid) || uid <= 0) return "Неверный список видящих";
+    if (skip.includes(uid)) continue;
+    picked.set(uid, v?.can_edit === true ? 1 : 0);
+  }
+  for (const uid of picked.keys()) {
+    const ok = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'").bind(uid).first();
+    if (!ok) return "Пользователь не найден";
+  }
+  return [...picked].map(([user_id, can_edit]) => ({ user_id, can_edit }));
+}
+
+async function replaceViewers(env: Env, taskId: number, list: { user_id: number; can_edit: number }[]): Promise<void> {
+  await env.DB.prepare("DELETE FROM task_access WHERE task_id = ?").bind(taskId).run();
+  for (const v of list) {
+    await env.DB.prepare("INSERT INTO task_access (task_id, user_id, can_edit) VALUES (?, ?, ?)")
+      .bind(taskId, v.user_id, v.can_edit)
+      .run();
+  }
 }
 
 async function createTask(request: Request, env: Env): Promise<Response> {
@@ -1926,6 +1993,8 @@ async function createTask(request: Request, env: Env): Promise<Response> {
     attName = await attachmentName(env, attachmentId);
     if (!attName) return json({ error: "Файл не найден" }, 400);
   }
+  const viewers = body.viewers === undefined ? [] : await cleanViewers(env, body.viewers, [user.id, assigneeId]);
+  if (typeof viewers === "string") return json({ error: viewers }, 400);
   const assignedByCommittee = isCommittee(user) && (forAll || assigneeId !== user.id) ? 1 : 0;
   const result = await env.DB.prepare(
     `INSERT INTO tasks (title, description, due_date, importance, creator_id, assignee_id, assigned_by_committee,
@@ -1947,8 +2016,12 @@ async function createTask(request: Request, env: Env): Promise<Response> {
     .run();
   const id = Number(result.meta.last_row_id);
   await replaceReminders(env, id, reminders);
+  await replaceViewers(env, id, viewers);
   if (forAll) await notifyAllApproved(env, user.id);
-  else if (assigneeId !== user.id) await notifyUsers(env, [assigneeId]);
+  else {
+    const notify = [...viewers.map((v) => v.user_id), ...(assigneeId !== user.id ? [assigneeId] : [])];
+    if (notify.length) await notifyUsers(env, notify);
+  }
   return json({ task: await loadTaskOut(env, id, user.id) }, 201);
 }
 
@@ -1959,7 +2032,9 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
   const task = await taskById(env, id, user.id);
   if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
   const isCreator = task.creator_id === user.id;
-  if (!isCreator && task.assignee_id !== user.id) return json({ error: "Нет доступа" }, 403);
+  // Создатель и видящие с правом редактирования меняют всё, исполнитель — только напоминания
+  const canEdit = isCreator || viewerAccess(user, task) === 1;
+  if (!canEdit && task.assignee_id !== user.id) return json({ error: "Нет доступа" }, 403);
   if (isLocked(task)) return json({ error: "Выполненную задачу нельзя редактировать" }, 403);
   const body = await readJson(request);
 
@@ -1970,7 +2045,7 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
   let assigneeId = task.assignee_id;
   let attachmentId = task.attachment_id;
   let attachmentLabel = task.attachment_name;
-  if (isCreator) {
+  if (canEdit) {
     if (body.title !== undefined) {
       title = str(body.title, TASK_TITLE_MAX);
       if (!title) return json({ error: "Укажите название задачи" }, 400);
@@ -2004,6 +2079,13 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
       }
     }
   }
+  // Видящих может менять только создатель
+  let newViewers: { user_id: number; can_edit: number }[] | null = null;
+  if (isCreator && body.viewers !== undefined) {
+    const cleaned = await cleanViewers(env, body.viewers, [task.creator_id, assigneeId]);
+    if (typeof cleaned === "string") return json({ error: cleaned }, 400);
+    newViewers = cleaned;
+  }
   // Новые напоминания проверяем до записи, чтобы при ошибке ничего не менялось
   let reminderList: string[] | null = null;
   if (body.reminders !== undefined) {
@@ -2020,6 +2102,14 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
   if (importance !== task.importance) changes.push({ f: "importance", from: String(task.importance), to: String(importance) });
   if (assigneeId !== task.assignee_id) changes.push({ f: "assignee", from: task.assignee_name, to: await userName(env, assigneeId) });
   if (attachmentId !== task.attachment_id) changes.push({ f: "attachment", from: task.attachment_name, to: attachmentLabel });
+  const oldViewers = parseViewers(task.viewers_json);
+  if (newViewers) {
+    const describe = (list: { user_id: number; can_edit: number; name?: string }[]) =>
+      list.length ? list.map((v) => `${v.name ?? ""}${v.can_edit ? " (ред.)" : ""}`).join(", ") : null;
+    const before = describe(oldViewers);
+    const after = describe(await Promise.all(newViewers.map(async (v) => ({ ...v, name: await userName(env, v.user_id) }))));
+    if (before !== after) changes.push({ f: "viewers", from: before, to: after });
+  }
 
   const assignedByCommittee = isCommittee(user) && (task.for_all === 1 || assigneeId !== user.id) ? 1 : 0;
   await env.DB.prepare(
@@ -2029,6 +2119,13 @@ async function updateTask(request: Request, env: Env, id: number): Promise<Respo
   )
     .bind(title, description, dueDate, importance, assigneeId, assignedByCommittee, attachmentId, attachmentLabel, id)
     .run();
+
+  if (newViewers) {
+    await replaceViewers(env, id, newViewers);
+    const oldIds = oldViewers.map((v) => v.user_id);
+    const added = newViewers.map((v) => v.user_id).filter((uid) => !oldIds.includes(uid));
+    if (added.length) await notifyUsers(env, added);
+  }
 
   if (reminderList) {
     const oldRem = (
