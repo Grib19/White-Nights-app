@@ -16,3 +16,12 @@ out/
 Thumbs.db
 .idea/
 .vscode/
+
+# Сборка TypeScript
+*.tsbuildinfo
+
+# локальная база и кеш wrangler
+.wrangler/
+
+# локальные секреты wrangler
+.dev.vars

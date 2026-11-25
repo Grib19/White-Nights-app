@@ -6,9 +6,14 @@ export interface Env {
   FILES: KVNamespace;
   // Полный ключ Ably (appId.keyId:secret), задаётся командой wrangler secret put ABLY_API_KEY
   ABLY_API_KEY?: string;
+  // Cloudflare Calls TURN: id ключа и API-токен (wrangler secret put TURN_KEY_ID / TURN_KEY_API_TOKEN)
+  TURN_KEY_ID?: string;
+  TURN_KEY_API_TOKEN?: string;
   // Ключи для push-уведомлений: публичный и приватный (wrangler secret put)
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;
+  // Workers AI (расшифровка голосовых), привязка задаётся в wrangler.toml
+  AI: Ai;
 }
 
 type Role = "candidate" | "fighter" | "master" | "commissar" | "commander";
@@ -360,6 +365,14 @@ async function getProfile(request: Request, env: Env, userId: number): Promise<R
   return json({ profile: row });
 }
 
+async function getProfileByUsername(request: Request, env: Env, name: string): Promise<Response> {
+  const found = await env.DB.prepare("SELECT user_id FROM profiles WHERE lower(username) = lower(?)")
+    .bind(name)
+    .first<{ user_id: number }>();
+  if (!found) return json({ error: "Пользователь не найден" }, 404);
+  return await getProfile(request, env, found.user_id);
+}
+
 async function getPrivateProfile(request: Request, env: Env, userId: number): Promise<Response> {
   const viewer = await approvedUser(request, env);
   if (!viewer) return json({ error: "Нужен вход" }, 401);
@@ -382,6 +395,13 @@ async function updateMyProfile(request: Request, env: Env): Promise<Response> {
   const username = cleanField(body.username, 32);
   if (username && !USERNAME_RE.test(username)) {
     return json({ error: "Имя пользователя: от 3 до 32 букв, цифр или _" }, 400);
+  }
+  if (username) {
+    if (username.toLowerCase() === "all") return json({ error: "Это имя зарезервировано" }, 400);
+    const taken = await env.DB.prepare("SELECT user_id FROM profiles WHERE lower(username) = lower(?) AND user_id <> ?")
+      .bind(username, user.id)
+      .first();
+    if (taken) return json({ error: "Это имя пользователя уже занято" }, 400);
   }
   const photoId = cleanField(body.photo_id, 64);
   if (photoId) {
@@ -1112,6 +1132,11 @@ interface ChatRow {
 }
 
 interface MessageRow {
+  canvas_id?: number | null;
+  canvas_mode?: string | null;
+  canvas_until?: string | null;
+  transcript?: string | null;
+  author_photo_id?: string | null;
   id: number;
   chat_id: number;
   author_id: number;
@@ -1172,7 +1197,16 @@ async function ablyToken(request: Request, env: Env): Promise<Response> {
   if (!user) return json({ error: "Нужен вход" }, 401);
   if (!env.ABLY_API_KEY) return json({ error: "Чаты ещё не подключены" }, 503);
   const capability: Record<string, string[]> = {};
-  for (const id of await accessibleChatIds(env, user)) capability[`chat:${id}`] = ["subscribe"];
+  const chatIds = await accessibleChatIds(env, user);
+  for (const id of chatIds) capability[`chat:${id}`] = ["subscribe"];
+  if (chatIds.length > 0 && chatIds.length <= 90) {
+    const calls = await env.DB.prepare(
+      `SELECT id FROM calls WHERE ended_at IS NULL AND chat_id IN (${chatIds.map(() => "?").join(",")})`,
+    )
+      .bind(...chatIds)
+      .all<{ id: number }>();
+    for (const c of calls.results) capability[`call:${c.id}`] = ["subscribe"];
+  }
   const keyName = env.ABLY_API_KEY.split(":")[0];
   const res = await fetch(`https://rest.ably.io/keys/${encodeURIComponent(keyName)}/requestToken`, {
     method: "POST",
@@ -1210,7 +1244,7 @@ async function listChats(request: Request, env: Env): Promise<Response> {
     .run();
 
   const rows = await env.DB.prepare(
-    `SELECT c.id, c.kind, c.title, c.photo_id, c.description, c.invite_mode, c.edit_mode, c.created_by,
+    `SELECT c.id, c.kind, c.title, c.photo_id, c.description, c.invite_mode, c.edit_mode, c.mention_mode, c.created_by,
             (SELECT p.photo_id FROM chat_members x LEFT JOIN profiles p ON p.user_id = x.user_id
               WHERE x.chat_id = c.id AND x.user_id <> ? LIMIT 1) AS other_photo,
             (SELECT body FROM messages WHERE chat_id = c.id AND deleted = 0 ORDER BY id DESC LIMIT 1) AS last_body,
@@ -1233,6 +1267,7 @@ async function listChats(request: Request, env: Env): Promise<Response> {
       description: string | null;
       invite_mode: string;
       edit_mode: string;
+      mention_mode: string;
       created_by: number | null;
       other_photo: string | null;
       last_body: string | null;
@@ -1250,6 +1285,7 @@ async function listChats(request: Request, env: Env): Promise<Response> {
     description: r.description,
     invite_mode: r.invite_mode,
     edit_mode: r.edit_mode,
+    mention_mode: r.mention_mode,
     created_by: r.created_by,
     last_body: r.last_body,
     last_kind: r.last_kind,
@@ -1323,6 +1359,7 @@ function publicMessage(r: MessageRow): Record<string, unknown> {
     chat_id: r.chat_id,
     author_id: r.author_id,
     author_name: r.author_name,
+    author_photo_id: r.author_photo_id ?? null,
     body: deleted ? "" : r.body,
     attachment_id: deleted ? null : r.attachment_id,
     attachment_name: deleted ? null : r.attachment_name,
@@ -1332,12 +1369,19 @@ function publicMessage(r: MessageRow): Record<string, unknown> {
     deleted,
     reply_to: r.reply_to_id ? { id: r.reply_to_id, author_name: r.reply_author ?? "", body: r.reply_body ?? "" } : null,
     forwarded_from: r.forwarded_from ?? null,
+    transcript: deleted ? null : r.transcript ?? null,
+    canvas_id: deleted ? null : r.canvas_id ?? null,
+    canvas_mode: deleted ? null : r.canvas_mode ?? null,
+    canvas_until: deleted ? null : r.canvas_until ?? null,
   };
 }
 
 const MESSAGE_SELECT = `SELECT m.id, m.chat_id, m.author_id, u.full_name AS author_name, m.body,
        m.attachment_id, m.attachment_name, m.attachment_kind, m.created_at, m.edited_at, m.deleted,
-       m.reply_to_id, m.forwarded_from,
+       m.reply_to_id, m.forwarded_from, m.transcript, m.canvas_id,
+       (SELECT cv.mode FROM canvases cv WHERE cv.id = m.canvas_id) AS canvas_mode,
+       (SELECT cv.edit_until FROM canvases cv WHERE cv.id = m.canvas_id) AS canvas_until,
+       (SELECT p.photo_id FROM profiles p WHERE p.user_id = m.author_id) AS author_photo_id,
        (SELECT u2.full_name FROM messages x JOIN users u2 ON u2.id = x.author_id WHERE x.id = m.reply_to_id) AS reply_author,
        (SELECT CASE WHEN x.deleted = 0 THEN x.body ELSE '' END FROM messages x WHERE x.id = m.reply_to_id) AS reply_body
   FROM messages m JOIN users u ON u.id = m.author_id`;
@@ -1389,7 +1433,34 @@ async function listMessages(request: Request, env: Env, chatId: number, url: URL
   });
 }
 
-async function sendMessage(request: Request, env: Env, chatId: number): Promise<Response> {
+// Base64 без переполнения стека на длинных файлах
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+// Расшифровка голосового через Whisper. Ошибка (например, исчерпан бесплатный лимит) не ломает отправку:
+// в поле transcript остаётся пустая строка, и клиент покажет «не удалось расшифровать».
+async function transcribeMessage(env: Env, messageId: number, chatId: number, attachmentId: string): Promise<void> {
+  let transcript = "";
+  try {
+    const file = await env.FILES.getWithMetadata(`att:${attachmentId}`, "arrayBuffer");
+    if (!file.value) throw new Error("Файл не найден");
+    const res = (await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+      audio: bytesToBase64(new Uint8Array(file.value)),
+    })) as { text?: string };
+    transcript = String(res.text ?? "").trim().slice(0, 4000);
+  } catch (e) {
+    console.error("Transcribe", e);
+  }
+  await env.DB.prepare("UPDATE messages SET transcript = ? WHERE id = ?").bind(transcript, messageId).run();
+  await ablyPublish(env, chatId, "transcript", { id: messageId, chat_id: chatId, transcript });
+}
+
+async function sendMessage(request: Request, env: Env, chatId: number, ctx: ExecutionContext): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
   const chat = await chatById(env, chatId);
@@ -1401,9 +1472,44 @@ async function sendMessage(request: Request, env: Env, chatId: number): Promise<
   const attachmentId = str(body.attachment_id, 64);
   const attachmentName = str(body.attachment_name, 200) || null;
   const attachmentKind =
-    body.attachment_kind === "image" ? "image" : body.attachment_kind === "audio" && attachmentId ? "audio" : attachmentId ? "file" : null;
+    body.attachment_kind === "image"
+      ? "image"
+      : body.attachment_kind === "audio" && attachmentId
+        ? "audio"
+        : body.attachment_kind === "video" && attachmentId
+          ? "video"
+          : body.attachment_kind === "video_note" && attachmentId
+            ? "video_note"
+            : attachmentId
+            ? "file"
+            : null;
   if (attachmentId && !/^[A-Za-z0-9_-]{10,64}$/.test(attachmentId)) return json({ error: "Неверный файл" }, 400);
   if (!text && !attachmentId) return json({ error: "Напишите сообщение или прикрепите файл" }, 400);
+  const linkCanvasId = Number(body.canvas_id) || 0;
+  if (linkCanvasId > 0) {
+    const own = await env.DB.prepare("SELECT id FROM canvases WHERE id = ? AND chat_id = ? AND author_id = ?")
+      .bind(linkCanvasId, chatId, user.id)
+      .first();
+    if (!own) return json({ error: "Холст не найден" }, 400);
+    // Повторная отправка того же холста заменяет его прошлую картинку в чате
+    if (attachmentId && attachmentKind === "image") {
+      const prev = await env.DB.prepare(
+        "SELECT id FROM messages WHERE chat_id = ? AND canvas_id = ? AND author_id = ? AND deleted = 0 ORDER BY id DESC LIMIT 1",
+      )
+        .bind(chatId, linkCanvasId, user.id)
+        .first<{ id: number }>();
+      if (prev) {
+        await env.DB.prepare("UPDATE messages SET attachment_id = ?, attachment_name = ?, attachment_kind = 'image' WHERE id = ?")
+          .bind(attachmentId, attachmentName, prev.id)
+          .run();
+        const replaced = await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`).bind(prev.id).first<MessageRow>();
+        if (!replaced) return json({ error: "Не удалось обновить холст" }, 500);
+        const updated = { ...publicMessage(replaced), reactions: [] };
+        await ablyPublish(env, chatId, "message", updated);
+        return json({ message: updated, replaced: true }, 200);
+      }
+    }
+  }
   const replyId = Number(body.reply_to_id) || 0;
   if (replyId > 0) {
     const target = await env.DB.prepare("SELECT id FROM messages WHERE id = ? AND chat_id = ? AND deleted = 0")
@@ -1413,23 +1519,497 @@ async function sendMessage(request: Request, env: Env, chatId: number): Promise<
   }
 
   const res = await env.DB.prepare(
-    `INSERT INTO messages (chat_id, author_id, body, attachment_id, attachment_name, attachment_kind, reply_to_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (chat_id, author_id, body, attachment_id, attachment_name, attachment_kind, reply_to_id, canvas_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(chatId, user.id, text, attachmentId || null, attachmentName, attachmentKind, replyId > 0 ? replyId : null)
+    .bind(chatId, user.id, text, attachmentId || null, attachmentName, attachmentKind, replyId > 0 ? replyId : null, linkCanvasId > 0 ? linkCanvasId : null)
     .run();
-  const row = await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`)
-    .bind(Number(res.meta.last_row_id))
-    .first<MessageRow>();
+  const messageId = Number(res.meta.last_row_id);
+  const row = await env.DB.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`).bind(messageId).first<MessageRow>();
   if (!row) return json({ error: "Не удалось сохранить" }, 500);
   const message = { ...publicMessage(row), reactions: [] };
   await ablyPublish(env, chatId, "message", message);
-  try {
-    await notifyChatMembers(request, env, chat, user.id);
-  } catch (e) {
-    console.error("Push", e);
+  if ((attachmentKind === "audio" || attachmentKind === "video_note") && attachmentId) {
+    ctx.waitUntil(transcribeMessage(env, messageId, chatId, attachmentId));
   }
+  if (await wantsMentionAll(env, chatId, user, text, chat.kind)) {
+    try {
+      ctx.waitUntil(notifyUsers(env, await audienceIdsExcept(env, chatId, chat.kind, user.id)));
+    } catch (e) {
+      console.error("Push all", e);
+    }
+  } else {
+    try {
+      await notifyChatMembers(request, env, chat, user.id);
+    } catch (e) {
+      console.error("Push", e);
+    }
+  }
+  ctx.waitUntil(notifyMentioned(env, chatId, chat.kind, user, text).catch((e) => console.error("Mention", e)));
   return json({ message }, 201);
+}
+
+// @all: упоминание всех участников; "creator" в mention_mode — только управляющим
+const ALL_MENTION_RE = /(^|[^\p{L}\p{N}_])@all(?![\p{L}\p{N}_])/iu;
+
+async function wantsMentionAll(env: Env, chatId: number, author: UserRow, text: string, kind: string): Promise<boolean> {
+  if (!ALL_MENTION_RE.test(text)) return false;
+  const row = await env.DB.prepare("SELECT mention_mode FROM chats WHERE id = ?")
+    .bind(chatId)
+    .first<{ mention_mode: string }>();
+  if (!row) return false;
+  if (row.mention_mode !== "creator") return true;
+  if (kind === "group") return await isGroupAdmin(env, chatId, author.id);
+  return isCommittee(author);
+}
+
+// Кто получает уведомление о @all (и о личных упоминаниях): участники чата без автора
+async function audienceIdsExcept(env: Env, chatId: number, kind: string, userId: number): Promise<number[]> {
+  let rows;
+  if (kind === "general") {
+    rows = await env.DB.prepare("SELECT id FROM users WHERE status = 'approved' AND id <> ? LIMIT 500")
+      .bind(userId)
+      .all<{ id: number }>();
+  } else if (kind === "committee") {
+    rows = await env.DB.prepare(
+      `SELECT id FROM users WHERE status = 'approved' AND role IN (${COMMITTEE.map(() => "?").join(",")}) AND id <> ? LIMIT 500`,
+    )
+      .bind(...COMMITTEE, userId)
+      .all<{ id: number }>();
+  } else {
+    rows = await env.DB.prepare("SELECT user_id AS id FROM chat_members WHERE chat_id = ? AND user_id <> ? LIMIT 500")
+      .bind(chatId, userId)
+      .all<{ id: number }>();
+  }
+  return rows.results.map((r) => r.id);
+}
+
+// Личные упоминания вида @имя: уведомление только тем, кто состоит в чате
+async function notifyMentioned(env: Env, chatId: number, kind: string, author: UserRow, text: string): Promise<void> {
+  const names = [...text.matchAll(/(^|[^\p{L}\p{N}_])@([\p{L}\p{N}_]{3,32})/gu)]
+    .map((m) => m[2].toLowerCase())
+    .filter((n) => n !== "all");
+  if (names.length === 0) return;
+  const uniq = [...new Set(names)].slice(0, 20);
+  const marks = uniq.map(() => "?").join(",");
+  const rows = await env.DB.prepare(`SELECT user_id AS id FROM profiles WHERE lower(username) IN (${marks}) AND user_id <> ? LIMIT 50`)
+    .bind(...uniq, author.id)
+    .all<{ id: number }>();
+  const allowed = new Set(await audienceIdsExcept(env, chatId, kind, author.id));
+  const ids = rows.results.map((r) => r.id).filter((id) => allowed.has(id));
+  if (ids.length > 0) await notifyUsers(env, ids);
+}
+
+// Медиа чата: фото, видео, файлы или ссылки из текста сообщений
+async function chatMedia(request: Request, env: Env, chatId: number, url: URL): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const kind = url.searchParams.get("kind") ?? "";
+  if (kind === "link") {
+    const rows = await env.DB.prepare(
+      `SELECT m.id, m.body, m.created_at, u.full_name AS author_name FROM messages m
+       JOIN users u ON u.id = m.author_id
+       WHERE m.chat_id = ? AND m.deleted = 0 AND m.body LIKE '%http%'
+       ORDER BY m.id DESC LIMIT 300`,
+    )
+      .bind(chatId)
+      .all<{ id: number; body: string; created_at: string; author_name: string }>();
+    const items: { id: number; url: string; author_name: string; created_at: string }[] = [];
+    for (const r of rows.results) {
+      for (const m of r.body.matchAll(/https?:\/\/[^\s<>"']+/gi)) {
+        items.push({ id: r.id, url: m[0], author_name: r.author_name, created_at: r.created_at });
+      }
+    }
+    return json({ items: items.slice(0, 200) });
+  }
+  if (kind !== "image" && kind !== "video" && kind !== "file") return json({ error: "Неверный раздел" }, 400);
+  // Видео в разделе «Видео» — только видеокружки; прикреплённые видеофайлы — в «Файлы»
+  const kinds = kind === "video" ? ["video_note"] : kind === "file" ? ["file", "video"] : ["image"];
+  const rows = await env.DB.prepare(
+    `SELECT m.id, m.attachment_id, m.attachment_name, m.created_at, u.full_name AS author_name FROM messages m
+     JOIN users u ON u.id = m.author_id
+     WHERE m.chat_id = ? AND m.deleted = 0 AND m.attachment_kind IN (${kinds.map(() => "?").join(",")})
+     ORDER BY m.id DESC LIMIT 200`,
+  )
+    .bind(chatId, ...kinds)
+    .all();
+  return json({ items: rows.results });
+}
+
+// Поиск по сообщениям чата (без учёта регистра по LIKE, спецсимволы экранируются)
+async function searchMessages(request: Request, env: Env, chatId: number, url: URL): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const q = (url.searchParams.get("q") ?? "").trim().slice(0, 100);
+  if (!q) return json({ items: [] });
+  const like = `%${q.replace(/[\\%_]/g, (c) => "\\" + c)}%`;
+  const rows = await env.DB.prepare(
+    `SELECT m.id, m.body, m.created_at, u.full_name AS author_name FROM messages m
+     JOIN users u ON u.id = m.author_id
+     WHERE m.chat_id = ? AND m.deleted = 0 AND m.body LIKE ? ESCAPE '\\'
+     ORDER BY m.id DESC LIMIT 50`,
+  )
+    .bind(chatId, like)
+    .all();
+  return json({ items: rows.results });
+}
+
+async function createCanvas(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const body = await readJson(request);
+  const mode = body.mode === "personal" ? "personal" : "shared";
+  const editors = body.editors === "managers" ? "managers" : body.editors === "author" ? "author" : "all";
+  let editUntil: string | null = null;
+  if (mode === "shared" && typeof body.edit_until === "string" && body.edit_until) {
+    const t = Date.parse(body.edit_until);
+    if (!isFinite(t) || t <= Date.now()) return json({ error: "Укажите срок в будущем" }, 400);
+    editUntil = new Date(t).toISOString();
+  }
+  const created = await env.DB.prepare("INSERT INTO canvases (chat_id, author_id, mode, editors, edit_until) VALUES (?, ?, ?, ?, ?)")
+    .bind(chatId, user.id, mode, mode === "personal" ? "author" : editors, editUntil)
+    .run();
+  return json({ canvas: { id: Number(created.meta.last_row_id), mode, editors, edit_until: editUntil } }, 201);
+}
+
+// ---------- Звонки (1 на 1 и группы до 10 участников). Сигнализация идёт через Ably, медиа — напрямую WebRTC ----------
+const CALL_MAX_PARTICIPANTS = 10;
+
+interface CallRow {
+  id: number;
+  chat_id: number;
+  video: number;
+  created_by: number;
+  ended_at: string | null;
+}
+
+async function callRow(env: Env, id: number): Promise<CallRow | null> {
+  return await env.DB.prepare("SELECT id, chat_id, video, created_by, ended_at FROM calls WHERE id = ?")
+    .bind(id)
+    .first<CallRow>();
+}
+
+// Участник считается в звонке, пока присылает heartbeat (раз в 20 секунд); иначе он «завис» после закрытия вкладки
+const CALL_STALE_MS = 60_000;
+function callStaleCutoff(): string {
+  return new Date(Date.now() - CALL_STALE_MS).toISOString();
+}
+
+async function activeParticipants(env: Env, callId: number): Promise<{ user_id: number; full_name: string; photo_id: string | null }[]> {
+  const rows = await env.DB.prepare(
+    `SELECT p.user_id, u.full_name, (SELECT pr.photo_id FROM profiles pr WHERE pr.user_id = p.user_id) AS photo_id
+     FROM call_participants p JOIN users u ON u.id = p.user_id
+     WHERE p.call_id = ? AND p.left_at IS NULL AND p.last_seen >= ? ORDER BY p.joined_at`,
+  )
+    .bind(callId, callStaleCutoff())
+    .all<{ user_id: number; full_name: string; photo_id: string | null }>();
+  return rows.results;
+}
+
+async function ablyPublishCall(env: Env, callId: number, name: string, data: unknown): Promise<void> {
+  if (!env.ABLY_API_KEY) return;
+  try {
+    await fetch(`https://rest.ably.io/channels/${encodeURIComponent(`call:${callId}`)}/messages`, {
+      method: "POST",
+      headers: { authorization: `Basic ${btoa(env.ABLY_API_KEY)}`, "content-type": "application/json" },
+      body: JSON.stringify({ name, data: JSON.stringify(data) }),
+    });
+  } catch {
+    // Участники переподключатся сами
+  }
+}
+
+async function startCall(request: Request, env: Env, chatId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await chatById(env, chatId);
+  if (!chat) return json({ error: "Чат не найден" }, 404);
+  if (!(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const body = await readJson(request);
+  const video = body.video === true ? 1 : 0;
+  let call = await env.DB.prepare("SELECT id, chat_id, video, created_by, ended_at FROM calls WHERE chat_id = ? AND ended_at IS NULL ORDER BY id DESC LIMIT 1")
+    .bind(chatId)
+    .first<CallRow>();
+  if (call && (await activeParticipants(env, call.id)).length === 0) {
+    await env.DB.prepare("UPDATE calls SET ended_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(call.id).run();
+    await ablyPublish(env, chatId, "call", { kind: "end", call_id: call.id });
+    call = null;
+  }
+  if (!call) {
+    const res = await env.DB.prepare("INSERT INTO calls (chat_id, created_by, video) VALUES (?, ?, ?)").bind(chatId, user.id, video).run();
+    call = { id: Number(res.meta.last_row_id), chat_id: chatId, video, created_by: user.id, ended_at: null };
+    await ablyPublish(env, chatId, "call", {
+      kind: "start",
+      call_id: call.id,
+      chat_id: chatId,
+      video: !!video,
+      from_id: user.id,
+      from_name: user.full_name,
+    });
+    try {
+      await notifyChatMembers(request, env, chat, user.id);
+    } catch (e) {
+      console.error("Push call", e);
+    }
+  }
+  return json({ call_id: call.id, video: !!call.video }, 201);
+}
+
+async function joinCall(request: Request, env: Env, callId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const c = await callRow(env, callId);
+  if (!c || c.ended_at) return json({ error: "Звонок уже завершён" }, 410);
+  const chat = await chatById(env, c.chat_id);
+  if (!chat || !(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const current = await activeParticipants(env, callId);
+  const already = current.some((p) => p.user_id === user.id);
+  if (!already && current.length >= CALL_MAX_PARTICIPANTS) {
+    return json({ error: `В звонке уже ${CALL_MAX_PARTICIPANTS} участников` }, 400);
+  }
+  await env.DB.prepare(
+    `INSERT INTO call_participants (call_id, user_id, left_at, last_seen) VALUES (?, ?, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+     ON CONFLICT(call_id, user_id) DO UPDATE SET left_at = NULL, joined_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+  )
+    .bind(callId, user.id)
+    .run();
+  const participants = await activeParticipants(env, callId);
+  const me = participants.find((p) => p.user_id === user.id);
+  if (!already) {
+    await ablyPublishCall(env, callId, "member", { kind: "join", user_id: user.id, full_name: user.full_name, photo_id: me?.photo_id ?? null });
+  }
+  return json({ call: { id: c.id, chat_id: c.chat_id, video: !!c.video }, participants, me: user.id });
+}
+
+async function pingCall(request: Request, env: Env, callId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const c = await callRow(env, callId);
+  if (!c || c.ended_at) return json({ error: "Звонок уже завершён" }, 410);
+  const res = await env.DB.prepare(
+    "UPDATE call_participants SET last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE call_id = ? AND user_id = ? AND left_at IS NULL",
+  )
+    .bind(callId, user.id)
+    .run();
+  if (!res.meta.changes) return json({ error: "Вы не в звонке" }, 403);
+  return json({ ok: true });
+}
+
+async function leaveCall(request: Request, env: Env, callId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const c = await callRow(env, callId);
+  if (!c) return json({ error: "Звонок не найден" }, 404);
+  await env.DB.prepare(
+    "UPDATE call_participants SET left_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE call_id = ? AND user_id = ? AND left_at IS NULL",
+  )
+    .bind(callId, user.id)
+    .run();
+  await ablyPublishCall(env, callId, "member", { kind: "leave", user_id: user.id });
+  const left = await activeParticipants(env, callId);
+  if (left.length === 0 && !c.ended_at) {
+    await env.DB.prepare("UPDATE calls SET ended_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(callId).run();
+    await ablyPublish(env, c.chat_id, "call", { kind: "end", call_id: callId });
+  }
+  return json({ ok: true });
+}
+
+async function signalCall(request: Request, env: Env, callId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const to = Number(body.to) || 0;
+  const data = body.data;
+  if (!to || !data || typeof data !== "object") return json({ error: "Неверный сигнал" }, 400);
+  if (JSON.stringify(data).length > 20000) return json({ error: "Слишком большой сигнал" }, 400);
+  const participants = await activeParticipants(env, callId);
+  if (!participants.some((p) => p.user_id === user.id) || !participants.some((p) => p.user_id === to)) {
+    return json({ error: "Участник не в звонке" }, 403);
+  }
+  await ablyPublishCall(env, callId, "signal", { from: user.id, to, data });
+  return json({ ok: true });
+}
+
+async function callIce(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const fallback = [{ urls: ["stun:stun.l.google.com:19302"] }];
+  if (!env.TURN_KEY_ID || !env.TURN_KEY_API_TOKEN) return json({ iceServers: fallback, turn: false });
+  try {
+    const res = await fetch(
+      `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(env.TURN_KEY_ID)}/credentials/generate-ice-servers`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ ttl: 86400 }),
+      },
+    );
+    if (!res.ok) return json({ iceServers: fallback, turn: false });
+    const data = (await res.json()) as { iceServers?: unknown };
+    const list = Array.isArray(data.iceServers) ? data.iceServers : data.iceServers ? [data.iceServers] : fallback;
+    return json({ iceServers: list, turn: true });
+  } catch {
+    return json({ iceServers: fallback, turn: false });
+  }
+}
+
+const CANVAS_MAX_STROKES = 3000;
+const CANVAS_MAX_POINTS = 1000;
+
+interface CanvasRow {
+  id: number;
+  chat_id: number;
+  author_id: number;
+  mode: string;
+  editors: string;
+  edit_until: string | null;
+}
+
+async function canvasRow(env: Env, id: number): Promise<CanvasRow | null> {
+  return await env.DB.prepare("SELECT id, chat_id, author_id, mode, editors, edit_until FROM canvases WHERE id = ?")
+    .bind(id)
+    .first<CanvasRow>();
+}
+
+// Кто может рисовать: личный холст — только автор; общий — по настройке editors и до срока edit_until
+async function canEditCanvas(env: Env, user: UserRow, c: CanvasRow, chat: ChatRow): Promise<boolean> {
+  if (c.mode === "personal") return c.author_id === user.id;
+  if (c.edit_until && Date.now() > Date.parse(c.edit_until)) return false;
+  if (c.author_id === user.id) return true;
+  if (c.editors === "author") return false;
+  if (c.editors === "managers") {
+    return chat.kind === "group" ? await isGroupAdmin(env, chat.id, user.id) : isCommittee(user);
+  }
+  return true;
+}
+
+// История холста: штрихи по порядку, подряд идущие штрихи одного автора (с перерывом до 10 минут) — одна запись
+async function canvasHistory(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const c = await canvasRow(env, id);
+  if (!c) return json({ error: "Холст не найден" }, 404);
+  const chat = await chatById(env, c.chat_id);
+  if (!chat || !(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const rows = await env.DB.prepare(
+    `SELECT s.id, s.author_id, s.data, s.created_at, u.full_name AS author_name,
+            (SELECT p.photo_id FROM profiles p WHERE p.user_id = s.author_id) AS author_photo_id
+     FROM canvas_strokes s JOIN users u ON u.id = s.author_id
+     WHERE s.canvas_id = ? ORDER BY s.id LIMIT ?`,
+  )
+    .bind(id, CANVAS_MAX_STROKES)
+    .all<{ id: number; author_id: number; data: string; created_at: string; author_name: string; author_photo_id: string | null }>();
+  const groups: {
+    author_id: number;
+    author_name: string;
+    author_photo_id: string | null;
+    started_at: string;
+    ended_at: string;
+    strokes: { color: string; width: number; points: [number, number][] }[];
+  }[] = [];
+  let last: (typeof groups)[number] | null = null;
+  for (const r of rows.results) {
+    const stroke = JSON.parse(r.data) as { color: string; width: number; points: [number, number][] };
+    const gap = last ? Date.parse(r.created_at) - Date.parse(last.ended_at) : 0;
+    if (!last || last.author_id !== r.author_id || gap > 10 * 60 * 1000) {
+      last = {
+        author_id: r.author_id,
+        author_name: r.author_name,
+        author_photo_id: r.author_photo_id ?? null,
+        started_at: r.created_at,
+        ended_at: r.created_at,
+        strokes: [],
+      };
+      groups.push(last);
+    }
+    last.ended_at = r.created_at;
+    last.strokes.push({ color: stroke.color, width: stroke.width, points: stroke.points });
+  }
+  return json({ items: groups });
+}
+
+async function getCanvas(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const c = await canvasRow(env, id);
+  if (!c) return json({ error: "Холст не найден" }, 404);
+  const chat = await chatById(env, c.chat_id);
+  if (!chat || !(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  const rows = await env.DB.prepare("SELECT id, author_id, data FROM canvas_strokes WHERE canvas_id = ? ORDER BY id LIMIT ?")
+    .bind(id, CANVAS_MAX_STROKES)
+    .all<{ id: number; author_id: number; data: string }>();
+  const strokes = rows.results.map((r) => ({ id: r.id, author_id: r.author_id, ...JSON.parse(r.data) }));
+  return json({
+    canvas: {
+      id: c.id,
+      mode: c.mode,
+      author_id: c.author_id,
+      can_draw: await canEditCanvas(env, user, c, chat),
+      editors: c.editors,
+      edit_until: c.edit_until,
+      can_clear: c.author_id === user.id,
+      strokes,
+    },
+  });
+}
+
+async function addStroke(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const c = await canvasRow(env, id);
+  if (!c) return json({ error: "Холст не найден" }, 404);
+  const chat = await chatById(env, c.chat_id);
+  if (!chat || !(await canAccessChat(env, user, chat))) return json({ error: "Нет доступа" }, 403);
+  if (!(await canEditCanvas(env, user, c, chat))) return json({ error: "Редактировать холст сейчас нельзя" }, 403);
+
+  const body = await readJson(request);
+  const color = typeof body.color === "string" && /^#[0-9a-fA-F]{6}$/.test(body.color) ? body.color : null;
+  if (!color) return json({ error: "Неверный цвет" }, 400);
+  const width = Number(body.width);
+  if (!(width >= 1 && width <= 40)) return json({ error: "Неверная толщина" }, 400);
+  if (!Array.isArray(body.points) || body.points.length < 1 || body.points.length > CANVAS_MAX_POINTS) {
+    return json({ error: "Неверный штрих" }, 400);
+  }
+  const clamp = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 1000) / 1000;
+  const points: [number, number][] = [];
+  for (const p of body.points as unknown[]) {
+    if (!Array.isArray(p) || typeof p[0] !== "number" || typeof p[1] !== "number" || !isFinite(p[0]) || !isFinite(p[1])) {
+      return json({ error: "Неверная точка" }, 400);
+    }
+    points.push([clamp(p[0]), clamp(p[1])]);
+  }
+  const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM canvas_strokes WHERE canvas_id = ?")
+    .bind(id)
+    .first<{ n: number }>();
+  if ((count?.n ?? 0) >= CANVAS_MAX_STROKES) return json({ error: "Холст заполнен" }, 400);
+
+  const data = JSON.stringify({ color, width, points });
+  const res = await env.DB.prepare("INSERT INTO canvas_strokes (canvas_id, author_id, data) VALUES (?, ?, ?)")
+    .bind(id, user.id, data)
+    .run();
+  const stroke = { id: Number(res.meta.last_row_id), author_id: user.id, color, width, points };
+  await ablyPublish(env, c.chat_id, "canvas", { id, stroke });
+  return json({ stroke }, 201);
+}
+
+async function clearCanvas(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const c = await canvasRow(env, id);
+  if (!c) return json({ error: "Холст не найден" }, 404);
+  if (c.author_id !== user.id) return json({ error: "Очистить холст может только автор" }, 403);
+  await env.DB.prepare("DELETE FROM canvas_strokes WHERE canvas_id = ?").bind(id).run();
+  await ablyPublish(env, c.chat_id, "canvas", { id, cleared: true });
+  return json({ ok: true });
 }
 
 async function editMessage(request: Request, env: Env, id: number): Promise<Response> {
@@ -1573,6 +2153,69 @@ async function setChatPhoto(request: Request, env: Env, chatId: number): Promise
 }
 
 // Участники чата: в группах и личных — кто в чате, в общих чатах — все участники отряда (или комсостав)
+// Админ группы: её создатель или участник, которого он назначил админом
+async function isGroupAdmin(env: Env, chatId: number, userId: number): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok FROM chats c
+      WHERE c.id = ? AND c.kind = 'group'
+        AND (c.created_by = ? OR EXISTS (SELECT 1 FROM chat_members m WHERE m.chat_id = c.id AND m.user_id = ? AND m.is_admin = 1))`,
+  )
+    .bind(chatId, userId, userId)
+    .first();
+  return !!row;
+}
+
+async function isGroupMember(env: Env, chatId: number, userId: number): Promise<boolean> {
+  const row = await env.DB.prepare("SELECT 1 AS ok FROM chat_members WHERE chat_id = ? AND user_id = ?").bind(chatId, userId).first();
+  return !!row;
+}
+
+// Участники группы, где пользователь админ: для постановки задач участникам чата
+async function listAdminChats(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chats = (
+    await env.DB.prepare(
+      `SELECT c.id, c.title FROM chats c
+        WHERE c.kind = 'group' AND (c.created_by = ? OR EXISTS (SELECT 1 FROM chat_members m WHERE m.chat_id = c.id AND m.user_id = ? AND m.is_admin = 1))
+        ORDER BY c.title`,
+    )
+      .bind(user.id, user.id)
+      .all<{ id: number; title: string }>()
+  ).results;
+  const out = [];
+  for (const c of chats) {
+    const members = (
+      await env.DB.prepare(
+        `SELECT u.id, u.full_name FROM chat_members m JOIN users u ON u.id = m.user_id
+          WHERE m.chat_id = ? AND u.status = 'approved' AND u.id != ? ORDER BY u.full_name`,
+      )
+        .bind(c.id, user.id)
+        .all()
+    ).results;
+    out.push({ id: c.id, title: c.title, members });
+  }
+  return json({ chats: out });
+}
+
+// Назначить или снять админа группы: только создатель группы
+async function setChatAdmin(request: Request, env: Env, chatId: number, targetId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const chat = await env.DB.prepare("SELECT id, kind, created_by FROM chats WHERE id = ?")
+    .bind(chatId)
+    .first<{ id: number; kind: string; created_by: number | null }>();
+  if (!chat || chat.kind !== "group") return json({ error: "Админов назначают только в группе" }, 400);
+  if (chat.created_by !== user.id) return json({ error: "Админов назначает создатель группы" }, 403);
+  if (targetId === user.id) return json({ error: "Создатель и так админ" }, 400);
+  if (!(await isGroupMember(env, chatId, targetId))) return json({ error: "Участник не в группе" }, 400);
+  const body = await readJson(request);
+  await env.DB.prepare("UPDATE chat_members SET is_admin = ? WHERE chat_id = ? AND user_id = ?")
+    .bind(body.admin === true ? 1 : 0, chatId, targetId)
+    .run();
+  return json({ ok: true });
+}
+
 async function listChatMembers(request: Request, env: Env, chatId: number): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
@@ -1594,7 +2237,20 @@ async function listChatMembers(request: Request, env: Env, chatId: number): Prom
       .bind(chatId)
       .all();
   }
-  return json({ members: rows.results, viewer_id: user.id });
+  const adminIds = new Set<number>();
+  const creatorRow = await env.DB.prepare("SELECT created_by FROM chats WHERE id = ?").bind(chatId).first<{ created_by: number | null }>();
+  const creatorId = creatorRow?.created_by ?? null;
+  if (chat.kind === "group") {
+    const flags = (await env.DB.prepare("SELECT user_id FROM chat_members WHERE chat_id = ? AND is_admin = 1").bind(chatId).all<{ user_id: number }>()).results;
+    for (const f of flags) adminIds.add(f.user_id);
+    if (creatorId !== null) adminIds.add(creatorId);
+  }
+  const members = rows.results.map((m: Record<string, unknown>) => ({
+    ...m,
+    is_admin: adminIds.has(Number(m.id)) ? 1 : 0,
+    is_creator: creatorId === Number(m.id) ? 1 : 0,
+  }));
+  return json({ members, viewer_id: user.id });
 }
 
 // Добавить людей в групповой чат: добавлять может любой участник группы
@@ -1645,6 +2301,7 @@ const API_ORIGIN = "https://white-nights-api.white-nights.workers.dev";
 interface TaskRow {
   id: number;
   title: string;
+  color: string | null;
   description: string;
   due_date: string | null;
   importance: number;
@@ -1653,6 +2310,7 @@ interface TaskRow {
   assignee_id: number;
   assignee_name: string;
   assigned_by_committee: number;
+  assigned_by_admin: number;
   attachment_id: string | null;
   attachment_name: string | null;
   status: string;
@@ -1689,8 +2347,8 @@ function cleanAssignee(task: TaskRow, raw: unknown): number | null | "bad" {
 }
 
 const TASK_SELECT = `SELECT t.id, t.title, t.description, t.due_date, t.importance, t.creator_id, cu.full_name AS creator_name,
-  t.assignee_id, au.full_name AS assignee_name, t.assigned_by_committee, t.attachment_id, t.attachment_name,
-  t.for_all, t.needs_confirm, t.confirm_condition,
+  t.assignee_id, au.full_name AS assignee_name, t.assigned_by_committee, t.assigned_by_admin, t.attachment_id, t.attachment_name,
+  t.for_all, t.needs_confirm, t.confirm_condition, t.color,
   CASE WHEN t.for_all = 1 THEN (CASE WHEN EXISTS (SELECT 1 FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?) THEN 'done' ELSE 'open' END) ELSE t.status END AS status,
   CASE WHEN t.for_all = 1 THEN (SELECT d.done_at FROM task_done d WHERE d.task_id = t.id AND d.user_id = ?) ELSE t.done_at END AS done_at,
   t.created_at, t.edited_at,
@@ -1717,6 +2375,7 @@ interface TaskAccessFields {
   creator_id: number;
   assignee_id: number;
   assigned_by_committee: number;
+  assigned_by_admin?: number;
   for_all?: number;
   viewers_json?: string | null;
   needs_confirm?: number;
@@ -1733,11 +2392,13 @@ function isExecutorOf(user: UserRow, t: TaskAccessFields): boolean {
 
 // Выполнение нужно подтвердить: комсостав поставил задачу, стоит галочка или исполнителей несколько
 function requiresConfirm(t: TaskAccessFields): boolean {
-  return t.needs_confirm === 1 || t.assigned_by_committee === 1 || executorCount(t) > 1;
+  return t.needs_confirm === 1 || t.assigned_by_committee === 1 || t.assigned_by_admin === 1 || executorCount(t) > 1;
 }
 
 // Подтверждает выполнение: при нескольких исполнителях — только создатель, иначе — комсостав
 function canConfirm(user: UserRow, t: TaskAccessFields & { creator_id: number }): boolean {
+  // Задачу, которую поставил админ чата, подтверждает сам админ
+  if (t.assigned_by_admin === 1) return t.creator_id === user.id;
   if (executorCount(t) > 1) return t.creator_id === user.id;
   return (t.assigned_by_committee === 1 || t.needs_confirm === 1) && isCommittee(user);
 }
@@ -1950,6 +2611,321 @@ async function replaceReminders(env: Env, taskId: number, list: string[]): Promi
   }
 }
 
+// ---- Доски в стиле Trello: у каждого участника своя доска, свои колонки, карточки — задачи
+type BoardRow = { id: number; title: string; color: string; creator_id: number };
+
+const BOARD_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const DEFAULT_BOARD_COLOR = "#4a8ef0";
+function boardColor(raw: unknown): string | null {
+  return typeof raw === "string" && BOARD_COLOR_RE.test(raw) ? raw : null;
+}
+
+async function boardAccess(env: Env, boardId: number, user: UserRow) {
+  const board = await env.DB.prepare("SELECT id, title, color, creator_id FROM boards WHERE id = ?").bind(boardId).first<BoardRow>();
+  if (!board) return { error: json({ error: "Доска не найдена" }, 404) } as const;
+  const isCreator = board.creator_id === user.id;
+  const m = await env.DB.prepare("SELECT can_edit FROM board_members WHERE board_id = ? AND user_id = ?")
+    .bind(boardId, user.id)
+    .first<{ can_edit: number }>();
+  if (!isCreator && !m) return { error: json({ error: "Нет доступа к доске" }, 403) } as const;
+  return { board, isCreator, canEdit: isCreator || (m?.can_edit ?? 0) === 1 } as const;
+}
+
+async function setBoardMembers(env: Env, boardId: number, creatorId: number, raw: unknown): Promise<void> {
+  if (!Array.isArray(raw)) return;
+  const stmts = [env.DB.prepare("DELETE FROM board_members WHERE board_id = ?").bind(boardId)];
+  const seen = new Set<number>();
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const m = item as { user_id?: unknown; can_edit?: unknown };
+    const uid = Number(m.user_id);
+    if (!Number.isInteger(uid) || uid <= 0 || uid === creatorId || seen.has(uid)) continue;
+    seen.add(uid);
+    const canEdit = m.can_edit === true || m.can_edit === 1 ? 1 : 0;
+    stmts.push(env.DB.prepare("INSERT INTO board_members (board_id, user_id, can_edit) VALUES (?, ?, ?)").bind(boardId, uid, canEdit));
+  }
+  await env.DB.batch(stmts);
+}
+
+async function listBoards(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const boards = (
+    await env.DB.prepare(
+      `SELECT b.id, b.title, b.color, b.creator_id, u.full_name AS creator_name,
+              (SELECT COUNT(*) FROM board_cards c WHERE c.board_id = b.id) AS cards_count,
+              (CASE WHEN b.creator_id = ? THEN 1
+                    WHEN EXISTS (SELECT 1 FROM board_members m WHERE m.board_id = b.id AND m.user_id = ? AND m.can_edit = 1) THEN 1
+                    ELSE 0 END) AS can_edit
+         FROM boards b JOIN users u ON u.id = b.creator_id
+        WHERE b.creator_id = ? OR EXISTS (SELECT 1 FROM board_members m WHERE m.board_id = b.id AND m.user_id = ?)
+        ORDER BY b.id DESC`,
+    )
+      .bind(user.id, user.id, user.id, user.id)
+      .all<{ id: number; title: string; color: string; creator_id: number; creator_name: string; cards_count: number; can_edit: number }>()
+  ).results;
+  if (boards.length === 0) return json({ boards: [] });
+  const marks = boards.map(() => "?").join(",");
+  const ids = boards.map((b) => b.id);
+  const cols = (
+    await env.DB.prepare(`SELECT id, board_id, title, color FROM board_columns WHERE board_id IN (${marks}) ORDER BY position, id`)
+      .bind(...ids)
+      .all<{ id: number; board_id: number; title: string; color: string | null }>()
+  ).results;
+  const cards = (
+    await env.DB.prepare(`SELECT board_id, column_id, task_id, color FROM board_cards WHERE board_id IN (${marks}) ORDER BY position, task_id`)
+      .bind(...ids)
+      .all<{ board_id: number; column_id: number; task_id: number; color: string | null }>()
+  ).results;
+  return json({
+    boards: boards.map((b) => ({
+      ...b,
+      columns: cols
+        .filter((c) => c.board_id === b.id)
+        .map((c) => ({
+          id: c.id,
+          title: c.title,
+          color: c.color,
+          cards: cards.filter((k) => k.column_id === c.id).map((k) => ({ task_id: k.task_id, color: k.color })),
+        })),
+    })),
+  });
+}
+
+async function createBoard(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const body = await readJson(request);
+  const title = str(body.title, 120);
+  if (!title) return json({ error: "Укажите название доски" }, 400);
+  const color = boardColor(body.color) ?? DEFAULT_BOARD_COLOR;
+  const res = await env.DB.prepare("INSERT INTO boards (title, creator_id, color) VALUES (?, ?, ?)").bind(title, user.id, color).run();
+  const id = Number(res.meta.last_row_id);
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO board_columns (board_id, title, position) VALUES (?, ?, 0)").bind(id, "К выполнению"),
+    env.DB.prepare("INSERT INTO board_columns (board_id, title, position) VALUES (?, ?, 1)").bind(id, "В работе"),
+  ]);
+  await setBoardMembers(env, id, user.id, body.members);
+  return json({ board: { id, title, color } }, 201);
+}
+
+async function getBoard(request: Request, env: Env, boardId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  const cols = (
+    await env.DB.prepare("SELECT id, title, position, color FROM board_columns WHERE board_id = ? ORDER BY position, id")
+      .bind(boardId)
+      .all<{ id: number; title: string; position: number; color: string | null }>()
+  ).results;
+  const cards = (
+    await env.DB.prepare("SELECT task_id, column_id, color FROM board_cards WHERE board_id = ? ORDER BY position, task_id")
+      .bind(boardId)
+      .all<{ task_id: number; column_id: number; color: string | null }>()
+  ).results;
+  const taskCache = new Map<number, Awaited<ReturnType<typeof loadTaskOut>>>();
+  for (const c of cards) {
+    if (!taskCache.has(c.task_id)) taskCache.set(c.task_id, await loadTaskOut(env, c.task_id, user.id));
+  }
+  const columns = cols.map((col) => ({
+    id: col.id,
+    title: col.title,
+    color: col.color,
+    cards: cards
+      .filter((c) => c.column_id === col.id)
+      .map((c) => {
+        const t = taskCache.get(c.task_id);
+        return t ? { ...t, card_color: c.color } : null;
+      })
+      .filter((t) => t !== null),
+  }));
+  const members = (
+    await env.DB.prepare(
+      "SELECT m.user_id, u.full_name, m.can_edit FROM board_members m JOIN users u ON u.id = m.user_id WHERE m.board_id = ? ORDER BY u.full_name",
+    )
+      .bind(boardId)
+      .all()
+  ).results;
+  return json({
+    board: { id: boardId, title: acc.board.title, color: acc.board.color, creator_id: acc.board.creator_id, is_creator: acc.isCreator, can_edit: acc.canEdit },
+    columns,
+    members,
+  });
+}
+
+async function updateBoard(request: Request, env: Env, boardId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  const body = await readJson(request);
+  if (body.title !== undefined) {
+    if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+    const title = str(body.title, 120);
+    if (!title) return json({ error: "Укажите название доски" }, 400);
+    await env.DB.prepare("UPDATE boards SET title = ? WHERE id = ?").bind(title, boardId).run();
+  }
+  if (body.color !== undefined) {
+    if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+    const color = boardColor(body.color);
+    if (!color) return json({ error: "Неверный цвет" }, 400);
+    await env.DB.prepare("UPDATE boards SET color = ? WHERE id = ?").bind(color, boardId).run();
+  }
+  if (body.members !== undefined) {
+    if (!acc.isCreator) return json({ error: "Участников доски меняет её создатель" }, 403);
+    await setBoardMembers(env, boardId, acc.board.creator_id, body.members);
+  }
+  return json({ ok: true });
+}
+
+async function deleteBoard(request: Request, env: Env, boardId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  if (!acc.isCreator) return json({ error: "Удалить доску может только её создатель" }, 403);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM board_cards WHERE board_id = ?").bind(boardId),
+    env.DB.prepare("DELETE FROM board_columns WHERE board_id = ?").bind(boardId),
+    env.DB.prepare("DELETE FROM board_members WHERE board_id = ?").bind(boardId),
+    env.DB.prepare("DELETE FROM boards WHERE id = ?").bind(boardId),
+  ]);
+  return json({ ok: true });
+}
+
+async function createBoardColumn(request: Request, env: Env, boardId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+  const body = await readJson(request);
+  const title = str(body.title, 60);
+  if (!title) return json({ error: "Укажите название колонки" }, 400);
+  const pos = await env.DB.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM board_columns WHERE board_id = ?")
+    .bind(boardId)
+    .first<{ p: number }>();
+  const res = await env.DB.prepare("INSERT INTO board_columns (board_id, title, position) VALUES (?, ?, ?)")
+    .bind(boardId, title, pos?.p ?? 0)
+    .run();
+  return json({ column: { id: Number(res.meta.last_row_id), title } }, 201);
+}
+
+async function updateBoardColumn(request: Request, env: Env, boardId: number, colId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+  const body = await readJson(request);
+  if (body.title !== undefined) {
+    const title = str(body.title, 60);
+    if (!title) return json({ error: "Укажите название колонки" }, 400);
+    await env.DB.prepare("UPDATE board_columns SET title = ? WHERE id = ? AND board_id = ?").bind(title, colId, boardId).run();
+  }
+  if (body.color !== undefined) {
+    // null — вернуть цвет доски
+    let color: string | null = null;
+    if (body.color !== null) {
+      color = boardColor(body.color);
+      if (!color) return json({ error: "Неверный цвет" }, 400);
+    }
+    await env.DB.prepare("UPDATE board_columns SET color = ? WHERE id = ? AND board_id = ?").bind(color, colId, boardId).run();
+  }
+  return json({ ok: true });
+}
+
+async function deleteBoardColumn(request: Request, env: Env, boardId: number, colId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM board_cards WHERE board_id = ? AND column_id = ?").bind(boardId, colId),
+    env.DB.prepare("DELETE FROM board_columns WHERE id = ? AND board_id = ?").bind(colId, boardId),
+  ]);
+  return json({ ok: true });
+}
+
+// Порядок карточек во всех колонках сразу: { columns: [{ column_id, task_ids: [...] }] }
+async function saveBoardOrder(request: Request, env: Env, boardId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+  const body = await readJson(request);
+  if (!Array.isArray(body.columns)) return json({ error: "Неверный формат" }, 400);
+  const colIds = new Set(
+    (await env.DB.prepare("SELECT id FROM board_columns WHERE board_id = ?").bind(boardId).all<{ id: number }>()).results.map((r) => r.id),
+  );
+  const stmts: D1PreparedStatement[] = [];
+  for (const item of body.columns as { column_id?: unknown; task_ids?: unknown }[]) {
+    const colId = Number(item.column_id);
+    if (!colIds.has(colId) || !Array.isArray(item.task_ids)) continue;
+    item.task_ids.forEach((raw, idx) => {
+      const taskId = Number(raw);
+      if (!Number.isInteger(taskId)) return;
+      stmts.push(
+        env.DB.prepare("UPDATE board_cards SET column_id = ?, position = ? WHERE board_id = ? AND task_id = ?").bind(colId, idx, boardId, taskId),
+      );
+    });
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  return json({ ok: true });
+}
+
+async function addBoardCard(request: Request, env: Env, boardId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+  const body = await readJson(request);
+  const taskId = Number(body.task_id);
+  const colId = Number(body.column_id);
+  const col = await env.DB.prepare("SELECT id FROM board_columns WHERE id = ? AND board_id = ?").bind(colId, boardId).first();
+  if (!col) return json({ error: "Колонка не найдена" }, 404);
+  const task = await loadTaskOut(env, taskId, user.id);
+  if (!task) return json({ error: "Задача не найдена" }, 404);
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO board_cards (board_id, task_id, column_id, position)
+     VALUES (?, ?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM board_cards WHERE column_id = ?))`,
+  )
+    .bind(boardId, taskId, colId, colId)
+    .run();
+  return json({ ok: true }, 201);
+}
+
+// Цвет карточки на конкретной доске; null — вернуть цвет доски
+async function updateBoardCard(request: Request, env: Env, boardId: number, taskId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+  const body = await readJson(request);
+  let color: string | null = null;
+  if (body.color !== null && body.color !== undefined) {
+    color = boardColor(body.color);
+    if (!color) return json({ error: "Неверный цвет" }, 400);
+  }
+  await env.DB.prepare("UPDATE board_cards SET color = ? WHERE board_id = ? AND task_id = ?").bind(color, boardId, taskId).run();
+  return json({ ok: true });
+}
+
+async function removeBoardCard(request: Request, env: Env, boardId: number, taskId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const acc = await boardAccess(env, boardId, user);
+  if ("error" in acc) return acc.error;
+  if (!acc.canEdit) return json({ error: "Нет прав менять доску" }, 403);
+  await env.DB.prepare("DELETE FROM board_cards WHERE board_id = ? AND task_id = ?").bind(boardId, taskId).run();
+  return json({ ok: true });
+}
+
 async function listTasks(request: Request, env: Env): Promise<Response> {
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
@@ -2071,7 +3047,18 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   if (forAll && !isCommittee(user)) return json({ error: "Задачу всему отряду ставит комсостав" }, 403);
   let assigneeId = forAll || body.assignee_id === undefined ? user.id : Number(body.assignee_id);
   if (!Number.isInteger(assigneeId) || assigneeId <= 0) return json({ error: "Неверный исполнитель" }, 400);
-  if (!forAll && assigneeId !== user.id && !isCommittee(user)) return json({ error: "Задачи другим назначает комсостав" }, 403);
+  // Другим участникам задачу ставит комсостав или админ группы, в которой состоит исполнитель
+  const chatIdRaw = body.chat_id === undefined || body.chat_id === null ? null : Number(body.chat_id);
+  let byAdmin = false;
+  if (!forAll && assigneeId !== user.id && !isCommittee(user)) {
+    const allowed =
+      chatIdRaw !== null &&
+      Number.isInteger(chatIdRaw) &&
+      (await isGroupAdmin(env, chatIdRaw, user.id)) &&
+      (await isGroupMember(env, chatIdRaw, assigneeId));
+    if (!allowed) return json({ error: "Задачи другим назначает комсостав или админ чата" }, 403);
+    byAdmin = true;
+  }
   const assignee = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND status = 'approved'")
     .bind(assigneeId)
     .first<{ id: number }>();
@@ -2103,8 +3090,8 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   const assignedByCommittee = isCommittee(user) && (forAll || assigneeId !== user.id) ? 1 : 0;
   const result = await env.DB.prepare(
     `INSERT INTO tasks (title, description, due_date, importance, creator_id, assignee_id, assigned_by_committee,
-       attachment_id, attachment_name, for_all, needs_confirm, confirm_condition)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       attachment_id, attachment_name, for_all, needs_confirm, confirm_condition, assigned_by_admin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       title,
@@ -2119,6 +3106,7 @@ async function createTask(request: Request, env: Env): Promise<Response> {
       forAll ? 1 : 0,
       needsConfirm,
       confirmCondition,
+      byAdmin ? 1 : 0,
     )
     .run();
   const id = Number(result.meta.last_row_id);
@@ -2286,6 +3274,39 @@ async function listTaskHistory(request: Request, env: Env, id: number): Promise<
   return json({
     history: rows.map((r) => ({ id: r.id, created_at: r.created_at, user_name: r.user_name, changes: JSON.parse(r.changes) as HistoryChange[] })),
   });
+}
+
+// Перенос задачи на другой день (срок меняется у всех, кто видит задачу)
+async function setTaskDue(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, id, user.id);
+  if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
+  if (!isTaskParty(user, task)) return json({ error: "Нет доступа" }, 403);
+  if (task.status === "done") return json({ error: "Выполненную задачу нельзя переносить" }, 400);
+  const body = await readJson(request);
+  const due = cleanDate(body.due_date);
+  if (!due) return json({ error: "Неверная дата" }, 400);
+  if (due < minDueDate()) return json({ error: "Срок не может быть в прошлом" }, 400);
+  await env.DB.prepare("UPDATE tasks SET due_date = ? WHERE id = ?").bind(due, id).run();
+  return json({ ok: true });
+}
+
+// Цвет задачи в списке; null — без цвета. Меняют те, кто участвует в задаче
+async function setTaskColor(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const task = await taskById(env, id, user.id);
+  if (!task || !canSeeTask(user, task)) return json({ error: "Не найдено" }, 404);
+  if (!isTaskParty(user, task)) return json({ error: "Нет доступа" }, 403);
+  const body = await readJson(request);
+  let color: string | null = null;
+  if (body.color !== null && body.color !== undefined) {
+    color = boardColor(body.color);
+    if (!color) return json({ error: "Неверный цвет" }, 400);
+  }
+  await env.DB.prepare("UPDATE tasks SET color = ? WHERE id = ?").bind(color, id).run();
+  return json({ ok: true });
 }
 
 async function setTaskStatus(request: Request, env: Env, id: number): Promise<Response> {
@@ -2589,10 +3610,10 @@ async function updateChatSettings(request: Request, env: Env, chatId: number): P
   const user = await approvedUser(request, env);
   if (!user) return json({ error: "Нужен вход" }, 401);
   const chat = await env.DB.prepare(
-    "SELECT id, kind, title, description, invite_mode, edit_mode, created_by FROM chats WHERE id = ?",
+    "SELECT id, kind, title, description, invite_mode, edit_mode, mention_mode, created_by FROM chats WHERE id = ?",
   )
     .bind(chatId)
-    .first<{ id: number; kind: string; title: string; description: string | null; invite_mode: string; edit_mode: string; created_by: number | null }>();
+    .first<{ id: number; kind: string; title: string; description: string | null; invite_mode: string; edit_mode: string; mention_mode: string; created_by: number | null }>();
   if (!chat) return json({ error: "Чат не найден" }, 404);
   if (chat.kind === "personal" || chat.kind === "favorites") return json({ error: "У этого чата нет настроек" }, 400);
 
@@ -2605,20 +3626,26 @@ async function updateChatSettings(request: Request, env: Env, chatId: number): P
   }
 
   const body = await readJson(request);
-  const title = chat.kind === "group" ? str(body.title, 60) || chat.title : chat.title;
+  // Название меняется в группе и в общих чатах (общий, комсостав)
+  const titleEditable = chat.kind === "group" || chat.kind === "general" || chat.kind === "committee";
+  const title = titleEditable ? str(body.title, 60) || chat.title : chat.title;
+  // Права: в группе — только создатель, в общих чатах — комсостав (проверено выше)
+  const manager = chat.kind === "group" ? isCreator : true;
   const description = str(body.description, 500) || null;
   // Права меняет только создатель группы
-  const inviteMode = chat.kind === "group" && isCreator && body.invite_mode === "creator" ? "creator" : isCreator && body.invite_mode === "all" ? "all" : chat.invite_mode;
-  const editMode = chat.kind === "group" && isCreator && body.edit_mode === "creator" ? "creator" : isCreator && body.edit_mode === "all" ? "all" : chat.edit_mode;
+  const inviteMode = manager && body.invite_mode === "creator" ? "creator" : manager && body.invite_mode === "all" ? "all" : chat.invite_mode;
+  const editMode = manager && body.edit_mode === "creator" ? "creator" : manager && body.edit_mode === "all" ? "all" : chat.edit_mode;
 
-  await env.DB.prepare("UPDATE chats SET title = ?, description = ?, invite_mode = ?, edit_mode = ? WHERE id = ?")
-    .bind(title, description, inviteMode, editMode, chatId)
+  const mentionMode = manager && body.mention_mode === "creator" ? "creator" : manager && body.mention_mode === "all" ? "all" : chat.mention_mode;
+
+  await env.DB.prepare("UPDATE chats SET title = ?, description = ?, invite_mode = ?, edit_mode = ?, mention_mode = ? WHERE id = ?")
+    .bind(title, description, inviteMode, editMode, mentionMode, chatId)
     .run();
   return json({ ok: true });
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -2635,6 +3662,8 @@ export default {
       if (method === "GET" && path === "/api/profiles") return await listProfiles(request, env);
       if (method === "PUT" && path === "/api/profiles/me") return await updateMyProfile(request, env);
       if (method === "PUT" && path === "/api/profiles/me/private") return await updateMyPrivate(request, env);
+      const usernameMatch = path.match(/^\/api\/profiles\/by-username\/([^/]+)$/);
+      if (method === "GET" && usernameMatch) return await getProfileByUsername(request, env, decodeURIComponent(usernameMatch[1]));
       const profileMatch = path.match(/^\/api\/profiles\/(\d+)(\/private)?$/);
       if (method === "GET" && profileMatch) {
         const id = Number(profileMatch[1]);
@@ -2648,10 +3677,37 @@ export default {
       if (method === "POST" && path === "/api/chats") return await createChat(request, env);
       const chatMessagesMatch = path.match(/^\/api\/chats\/(\d+)\/messages$/);
       if (chatMessagesMatch && method === "GET") return await listMessages(request, env, Number(chatMessagesMatch[1]), url);
-      if (chatMessagesMatch && method === "POST") return await sendMessage(request, env, Number(chatMessagesMatch[1]));
+      if (chatMessagesMatch && method === "POST") return await sendMessage(request, env, Number(chatMessagesMatch[1]), ctx);
+      const chatCanvasMatch = path.match(/^\/api\/chats\/(\d+)\/canvases$/);
+      if (chatCanvasMatch && method === "POST") return await createCanvas(request, env, Number(chatCanvasMatch[1]));
+      const canvasMatch = path.match(/^\/api\/canvases\/(\d+)$/);
+      if (canvasMatch && method === "GET") return await getCanvas(request, env, Number(canvasMatch[1]));
+      if (method === "GET" && path === "/api/calls/ice") return await callIce(request, env);
+      const chatCallMatch = path.match(/^\/api\/chats\/(\d+)\/calls$/);
+      if (chatCallMatch && method === "POST") return await startCall(request, env, Number(chatCallMatch[1]));
+      const callActionMatch = path.match(/^\/api\/calls\/(\d+)\/(join|leave|signal|ping)$/);
+      if (callActionMatch && method === "POST") {
+        const cid = Number(callActionMatch[1]);
+        if (callActionMatch[2] === "join") return await joinCall(request, env, cid);
+        if (callActionMatch[2] === "leave") return await leaveCall(request, env, cid);
+        if (callActionMatch[2] === "ping") return await pingCall(request, env, cid);
+        return await signalCall(request, env, cid);
+      }
+      const canvasHistoryMatch = path.match(/^\/api\/canvases\/(\d+)\/history$/);
+      if (canvasHistoryMatch && method === "GET") return await canvasHistory(request, env, Number(canvasHistoryMatch[1]));
+      const canvasStrokeMatch = path.match(/^\/api\/canvases\/(\d+)\/strokes$/);
+      if (canvasStrokeMatch && method === "POST") return await addStroke(request, env, Number(canvasStrokeMatch[1]));
+      if (canvasStrokeMatch && method === "DELETE") return await clearCanvas(request, env, Number(canvasStrokeMatch[1]));
+      const chatMediaMatch = path.match(/^\/api\/chats\/(\d+)\/media$/);
+      if (chatMediaMatch && method === "GET") return await chatMedia(request, env, Number(chatMediaMatch[1]), url);
+      const chatSearchMatch = path.match(/^\/api\/chats\/(\d+)\/search$/);
+      if (chatSearchMatch && method === "GET") return await searchMessages(request, env, Number(chatSearchMatch[1]), url);
       const chatMembersMatch = path.match(/^\/api\/chats\/(\d+)\/members$/);
       if (chatMembersMatch && method === "GET") return await listChatMembers(request, env, Number(chatMembersMatch[1]));
       if (chatMembersMatch && method === "POST") return await addChatMembers(request, env, Number(chatMembersMatch[1]));
+      const chatAdminMatch = path.match(/^\/api\/chats\/(\d+)\/members\/(\d+)\/admin$/);
+      if (chatAdminMatch && method === "PUT") return await setChatAdmin(request, env, Number(chatAdminMatch[1]), Number(chatAdminMatch[2]));
+      if (method === "GET" && path === "/api/chat-admin-targets") return await listAdminChats(request, env);
       const chatLeaveMatch = path.match(/^\/api\/chats\/(\d+)\/members\/me$/);
       if (chatLeaveMatch && method === "DELETE") return await leaveChat(request, env, Number(chatLeaveMatch[1]));
       if (method === "GET" && path === "/api/push/key") return await pushKey(env);
@@ -2686,6 +3742,24 @@ export default {
       if (method === "POST" && path === "/api/posts") return await addPost(request, env);
       if (method === "POST" && path === "/api/reactions") return await toggleReaction(request, env);
 
+      if (method === "GET" && path === "/api/boards") return await listBoards(request, env);
+      if (method === "POST" && path === "/api/boards") return await createBoard(request, env);
+      const boardMatch = path.match(/^\/api\/boards\/(\d+)$/);
+      if (boardMatch && method === "GET") return await getBoard(request, env, Number(boardMatch[1]));
+      if (boardMatch && method === "PUT") return await updateBoard(request, env, Number(boardMatch[1]));
+      if (boardMatch && method === "DELETE") return await deleteBoard(request, env, Number(boardMatch[1]));
+      const boardColsMatch = path.match(/^\/api\/boards\/(\d+)\/columns$/);
+      if (boardColsMatch && method === "POST") return await createBoardColumn(request, env, Number(boardColsMatch[1]));
+      const boardColMatch = path.match(/^\/api\/boards\/(\d+)\/columns\/(\d+)$/);
+      if (boardColMatch && method === "PUT") return await updateBoardColumn(request, env, Number(boardColMatch[1]), Number(boardColMatch[2]));
+      if (boardColMatch && method === "DELETE") return await deleteBoardColumn(request, env, Number(boardColMatch[1]), Number(boardColMatch[2]));
+      const boardOrderMatch = path.match(/^\/api\/boards\/(\d+)\/order$/);
+      if (boardOrderMatch && method === "PUT") return await saveBoardOrder(request, env, Number(boardOrderMatch[1]));
+      const boardCardsMatch = path.match(/^\/api\/boards\/(\d+)\/cards$/);
+      if (boardCardsMatch && method === "POST") return await addBoardCard(request, env, Number(boardCardsMatch[1]));
+      const boardCardMatch = path.match(/^\/api\/boards\/(\d+)\/cards\/(\d+)$/);
+      if (boardCardMatch && method === "PUT") return await updateBoardCard(request, env, Number(boardCardMatch[1]), Number(boardCardMatch[2]));
+      if (boardCardMatch && method === "DELETE") return await removeBoardCard(request, env, Number(boardCardMatch[1]), Number(boardCardMatch[2]));
       if (method === "GET" && path === "/api/tasks") return await listTasks(request, env);
       if (method === "POST" && path === "/api/tasks") return await createTask(request, env);
       if (method === "GET" && path === "/api/tasks/badge") return await taskBadge(request, env);
@@ -2694,6 +3768,10 @@ export default {
       if (taskMatch && method === "DELETE") return await deleteTask(request, env, Number(taskMatch[1]));
       const taskStatusMatch = path.match(/^\/api\/tasks\/(\d+)\/status$/);
       if (taskStatusMatch && method === "PUT") return await setTaskStatus(request, env, Number(taskStatusMatch[1]));
+      const taskColorMatch = path.match(/^\/api\/tasks\/(\d+)\/color$/);
+      if (taskColorMatch && method === "PUT") return await setTaskColor(request, env, Number(taskColorMatch[1]));
+      const taskDueMatch = path.match(/^\/api\/tasks\/(\d+)\/due$/);
+      if (taskDueMatch && method === "PUT") return await setTaskDue(request, env, Number(taskDueMatch[1]));
       const taskCommentsMatch = path.match(/^\/api\/tasks\/(\d+)\/comments$/);
       if (taskCommentsMatch && method === "GET") return await listTaskComments(request, env, Number(taskCommentsMatch[1]));
       if (taskCommentsMatch && method === "POST") return await addTaskComment(request, env, Number(taskCommentsMatch[1]));
