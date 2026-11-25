@@ -17,6 +17,7 @@ export const ROLES = [
   { value: "master", label: "Мастер" },
   { value: "commissar", label: "Комиссар" },
   { value: "commander", label: "Командир" },
+  { value: "press", label: "Пресрук" },
 ];
 
 export const COMMITTEE_ROLES = ["master", "commissar", "commander"];
@@ -179,4 +180,34 @@ export function loadImage(id: string): Promise<string | null> {
     if (!res.ok) return null;
     return URL.createObjectURL(await res.blob());
   });
+}
+
+// Фото галереи: лежит на Google Диске, отдаётся через сервер
+export function loadGalleryPhoto(id: number): Promise<string | null> {
+  return cachedImage(`gal:${id}`, async () => {
+    const res = await fetch(baseUrl() + `/api/gallery/photos/${id}`, { headers: authHeaders() });
+    if (!res.ok) return null;
+    return URL.createObjectURL(await res.blob());
+  });
+}
+
+// Загрузка фото в альбом: файл целиком, имя и подпись — в заголовках
+export async function uploadGalleryPhoto(
+  albumId: number,
+  file: File,
+  caption: string,
+): Promise<{ ok: boolean; id?: number; error?: string }> {
+  const res = await fetch(baseUrl() + `/api/gallery/albums/${albumId}/photos`, {
+    method: "POST",
+    headers: {
+      ...authHeaders(),
+      "content-type": file.type || "image/jpeg",
+      "x-file-name": encodeURIComponent(file.name),
+      "x-caption": encodeURIComponent(caption),
+    },
+    body: file,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 201) return { ok: true, id: data.photo?.id };
+  return { ok: false, error: data.error ?? "Не удалось загрузить фото" };
 }

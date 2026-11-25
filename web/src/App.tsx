@@ -9,10 +9,11 @@ import { MusicPage } from "./pages/MusicPage";
 import { FeedPage } from "./pages/FeedPage";
 import { ChatsPage } from "./pages/ChatsPage";
 import { TasksPage } from "./pages/TasksPage";
+import { GalleryPage } from "./pages/GalleryPage";
 import { TabIcon } from "./TabIcon";
 
 type Mode = "login" | "register";
-type Tab = "profile" | "feed" | "chats" | "tasks" | "members" | "info" | "music" | "committee";
+type Tab = "profile" | "feed" | "chats" | "tasks" | "members" | "gallery" | "info" | "music" | "committee";
 
 type Pending = User;
 
@@ -105,6 +106,7 @@ export function App() {
       ["profile", "Профиль"],
       ["music", "Музыка"],
       ["members", "Участники"],
+      ["gallery", "Галерея"],
       ["info", "Информация"],
     ];
     if (isCommittee) tabList.push(["committee", "Комсостав"]);
@@ -161,6 +163,7 @@ export function App() {
             {tab === "tasks" && <TasksPage viewer={user} onChanged={refreshBadge} />}
             {tab === "profile" && <ProfilePage user={user} />}
             {tab === "members" && <MembersPage viewer={user} />}
+            {tab === "gallery" && <GalleryPage viewer={user} />}
             {tab === "info" && <InfoPage viewer={user} />}
             {tab === "music" && <MusicPage viewer={user} />}
             {tab === "committee" && isCommittee && <CommitteePage />}
@@ -258,7 +261,7 @@ function PendingCard({
       <label>
         Роль
         <select style={input} value={role} onChange={(e) => setRole(e.target.value)}>
-          {["candidate", "fighter", "master", "commissar", "commander"].map((r) => (
+          {["candidate", "fighter", "master", "commissar", "commander", "press"].map((r) => (
             <option key={r} value={r}>{roleLabel(r)}</option>
           ))}
         </select>

@@ -12,14 +12,17 @@ export interface Env {
   // Ключи для push-уведомлений: публичный и приватный (wrangler secret put)
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;
+  // Google Drive (галерея): OAuth-клиент, задаётся командой wrangler secret put
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
   // Workers AI (расшифровка голосовых), привязка задаётся в wrangler.toml
   AI: Ai;
 }
 
-type Role = "candidate" | "fighter" | "master" | "commissar" | "commander";
+type Role = "candidate" | "fighter" | "master" | "commissar" | "commander" | "press";
 type Status = "pending" | "approved" | "rejected";
 
-const ROLES: Role[] = ["candidate", "fighter", "master", "commissar", "commander"];
+const ROLES: Role[] = ["candidate", "fighter", "master", "commissar", "commander", "press"];
 // Роли, которые может назначать только командир или комиссар
 const SENIOR_ROLES: Role[] = ["master", "commissar", "commander"];
 // Роли, которые могут подтверждать регистрацию
@@ -37,7 +40,7 @@ const enc = new TextEncoder();
 const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization, x-song-title, x-song-author, x-file-name",
+  "access-control-allow-headers": "content-type, authorization, x-song-title, x-song-author, x-file-name, x-caption",
 };
 
 function json(data: unknown, status = 200): Response {
@@ -3644,6 +3647,425 @@ async function updateChatSettings(request: Request, env: Env, chatId: number): P
   return json({ ok: true });
 }
 
+// ---------- Галерея ----------
+// Альбомы и фотографии. Метаданные в D1, файлы — на Google Диске в папке приложения.
+// Диск подключает комсостав или пресрук один раз через OAuth (scope drive.file).
+
+const GALLERY_ADMIN_ROLES: Role[] = ["master", "commissar", "commander", "press"];
+const GALLERY_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+const GALLERY_MAX_PHOTO = 20 * 1024 * 1024;
+const GALLERY_FOLDER = "Белые Ночи — Галерея";
+const GALLERY_CAPTION_MAX = 500;
+
+function canManageGallery(user: UserRow): boolean {
+  return GALLERY_ADMIN_ROLES.includes(user.role);
+}
+
+interface AlbumRow {
+  id: number;
+  title: string;
+  description: string;
+  cover_photo_id: number | null;
+  upload_scope: string;
+  created_by: number;
+  created_by_name: string;
+  created_at: string;
+  photos_count: number;
+}
+
+interface PhotoRow {
+  id: number;
+  album_id: number;
+  drive_file_id: string;
+  mime: string;
+  name: string;
+  caption: string;
+  added_by: number;
+  added_by_name: string;
+  created_at: string;
+}
+
+async function galleryConfigured(env: Env): Promise<boolean> {
+  return Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
+}
+
+async function gdriveAuth(env: Env): Promise<{ refresh_token: string; folder_id: string; connected_by: number; connected_at: string } | null> {
+  return await env.DB.prepare("SELECT refresh_token, folder_id, connected_by, connected_at FROM gdrive_auth WHERE id = 1")
+    .first<{ refresh_token: string; folder_id: string; connected_by: number; connected_at: string }>();
+}
+
+async function galleryConnected(env: Env): Promise<boolean> {
+  return (await galleryConfigured(env)) && Boolean(await gdriveAuth(env));
+}
+
+// Токен доступа Google: обновляем по refresh_token и держим в KV, чтобы не ходить за ним на каждый запрос
+async function driveToken(env: Env): Promise<string | null> {
+  if (!(await galleryConfigured(env))) return null;
+  const cached = await env.FILES.get("gal:token");
+  if (cached) return cached;
+  const auth = await gdriveAuth(env);
+  if (!auth) return null;
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: env.GOOGLE_CLIENT_ID ?? "",
+      client_secret: env.GOOGLE_CLIENT_SECRET ?? "",
+      refresh_token: auth.refresh_token,
+      grant_type: "refresh_token",
+    }),
+  });
+  if (!res.ok) {
+    console.error("Drive token", res.status, await res.text());
+    return null;
+  }
+  const data = (await res.json()) as { access_token?: string; expires_in?: number };
+  if (!data.access_token) return null;
+  await env.FILES.put("gal:token", data.access_token, { expirationTtl: Math.max(60, (data.expires_in ?? 3600) - 60) });
+  return data.access_token;
+}
+
+// Загрузка фото на Диск: сначала содержимое, затем имя и папка
+async function driveUpload(env: Env, token: string, folderId: string, name: string, mime: string, bytes: ArrayBuffer): Promise<string | null> {
+  const up = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=media&fields=id", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": mime },
+    body: bytes,
+  });
+  if (!up.ok) {
+    console.error("Drive upload", up.status, await up.text());
+    return null;
+  }
+  const created = (await up.json()) as { id?: string };
+  if (!created.id) return null;
+  const patch = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(created.id)}?addParents=${encodeURIComponent(folderId)}&fields=id`,
+    {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ name }),
+    },
+  );
+  if (!patch.ok) console.error("Drive rename", patch.status, await patch.text());
+  return created.id;
+}
+
+async function driveDelete(env: Env, token: string | null, fileId: string): Promise<void> {
+  if (!token) return;
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok && res.status !== 404) console.error("Drive delete", res.status, await res.text());
+}
+
+// Список альбомов: видят все подтверждённые участники
+async function listAlbums(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const rows = (
+    await env.DB.prepare(
+      `SELECT a.id, a.title, a.description, a.cover_photo_id, a.upload_scope, a.created_by, a.created_at,
+              u.full_name AS created_by_name,
+              (SELECT COUNT(*) FROM album_photos p WHERE p.album_id = a.id) AS photos_count
+         FROM albums a JOIN users u ON u.id = a.created_by
+        ORDER BY a.id DESC`,
+    ).all<AlbumRow>()
+  ).results;
+  const manager = canManageGallery(user);
+  return json({
+    albums: rows.map((r) => ({
+      ...r,
+      can_manage: manager || r.created_by === user.id,
+      can_upload: manager || r.created_by === user.id || r.upload_scope === "all",
+    })),
+    can_manage: manager,
+    configured: await galleryConfigured(env),
+    connected: await galleryConnected(env),
+  });
+}
+
+async function albumRow(env: Env, id: number): Promise<AlbumRow | null> {
+  return await env.DB.prepare(
+    `SELECT a.id, a.title, a.description, a.cover_photo_id, a.upload_scope, a.created_by, a.created_at,
+            u.full_name AS created_by_name,
+            (SELECT COUNT(*) FROM album_photos p WHERE p.album_id = a.id) AS photos_count
+       FROM albums a JOIN users u ON u.id = a.created_by WHERE a.id = ?`,
+  )
+    .bind(id)
+    .first<AlbumRow>();
+}
+
+async function createAlbum(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  if (!canManageGallery(user)) return json({ error: "Создавать альбомы может комсостав и пресрук" }, 403);
+  const body = await readJson(request);
+  const title = str(body.title, 120);
+  if (!title) return json({ error: "Укажите название альбома" }, 400);
+  const description = str(body.description, 1000);
+  const scope = body.upload_scope === "all" ? "all" : "managers";
+  const res = await env.DB.prepare("INSERT INTO albums (title, description, upload_scope, created_by) VALUES (?, ?, ?, ?)")
+    .bind(title, description, scope, user.id)
+    .run();
+  return json({ album: await albumRow(env, Number(res.meta.last_row_id)) }, 201);
+}
+
+async function getAlbum(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const album = await albumRow(env, id);
+  if (!album) return json({ error: "Альбом не найден" }, 404);
+  const photos = (
+    await env.DB.prepare(
+      `SELECT p.id, p.album_id, p.drive_file_id, p.mime, p.name, p.caption, p.added_by, p.created_at,
+              u.full_name AS added_by_name
+         FROM album_photos p JOIN users u ON u.id = p.added_by
+        WHERE p.album_id = ? ORDER BY p.id`,
+    )
+      .bind(id)
+      .all<PhotoRow>()
+  ).results;
+  const manager = canManageGallery(user);
+  const canManageAlbum = manager || album.created_by === user.id;
+  return json({
+    album: { ...album, can_manage: canManageAlbum },
+    photos: photos.map((p) => ({
+      id: p.id,
+      caption: p.caption,
+      mime: p.mime,
+      name: p.name,
+      added_by: p.added_by,
+      added_by_name: p.added_by_name,
+      created_at: p.created_at,
+      can_delete: canManageAlbum || p.added_by === user.id,
+    })),
+    can_upload: canManageAlbum || album.upload_scope === "all",
+    connected: await galleryConnected(env),
+  });
+}
+
+async function updateAlbum(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const album = await albumRow(env, id);
+  if (!album) return json({ error: "Альбом не найден" }, 404);
+  if (!(canManageGallery(user) || album.created_by === user.id)) {
+    return json({ error: "Менять альбом может создатель, комсостав и пресрук" }, 403);
+  }
+  const body = await readJson(request);
+  const title = body.title === undefined ? album.title : str(body.title, 120);
+  if (!title) return json({ error: "Укажите название альбома" }, 400);
+  const description = body.description === undefined ? album.description : str(body.description, 1000);
+  const scope = body.upload_scope === undefined ? album.upload_scope : body.upload_scope === "all" ? "all" : "managers";
+  await env.DB.prepare("UPDATE albums SET title = ?, description = ?, upload_scope = ? WHERE id = ?")
+    .bind(title, description, scope, id)
+    .run();
+  return json({ album: await albumRow(env, id) });
+}
+
+async function deleteAlbum(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const album = await albumRow(env, id);
+  if (!album) return json({ error: "Альбом не найден" }, 404);
+  if (!(canManageGallery(user) || album.created_by === user.id)) {
+    return json({ error: "Удалить альбом может создатель, комсостав и пресрук" }, 403);
+  }
+  const photos = (
+    await env.DB.prepare("SELECT id, drive_file_id FROM album_photos WHERE album_id = ?").bind(id).all<{ id: number; drive_file_id: string }>()
+  ).results;
+  const token = await driveToken(env);
+  for (const p of photos) await driveDelete(env, token, p.drive_file_id);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM album_photos WHERE album_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM albums WHERE id = ?").bind(id),
+  ]);
+  return json({ ok: true });
+}
+
+async function addAlbumPhoto(request: Request, env: Env, albumId: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const album = await albumRow(env, albumId);
+  if (!album) return json({ error: "Альбом не найден" }, 404);
+  const manager = canManageGallery(user);
+  if (!(manager || album.created_by === user.id || album.upload_scope === "all")) {
+    return json({ error: "В этот альбом фото добавляет комсостав и пресрук" }, 403);
+  }
+  if (!(await galleryConnected(env))) {
+    return json({ error: "Google Диск не подключён" }, 503);
+  }
+  const type = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+  if (!GALLERY_TYPES.includes(type)) return json({ error: "Можно загружать только фото: jpg, png, webp, gif" }, 400);
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength === 0) return json({ error: "Пустой файл" }, 400);
+  if (bytes.byteLength > GALLERY_MAX_PHOTO) return json({ error: "Фото больше 20 МБ" }, 413);
+  const name = decodeHeader(request.headers.get("x-file-name"), 200) || `Фото ${Date.now()}`;
+  const caption = decodeHeader(request.headers.get("x-caption"), GALLERY_CAPTION_MAX);
+  const token = await driveToken(env);
+  const auth = await gdriveAuth(env);
+  if (!token || !auth) return json({ error: "Не удалось войти в Google Диск, подключите его заново" }, 502);
+  const fileId = await driveUpload(env, token, auth.folder_id, name, type, bytes);
+  if (!fileId) return json({ error: "Google Диск не принял файл, попробуйте ещё раз" }, 502);
+  const res = await env.DB.prepare(
+    "INSERT INTO album_photos (album_id, drive_file_id, mime, name, caption, added_by) VALUES (?, ?, ?, ?, ?, ?)",
+  )
+    .bind(albumId, fileId, type, name, caption, user.id)
+    .run();
+  const photoId = Number(res.meta.last_row_id);
+  if (album.cover_photo_id === null) {
+    await env.DB.prepare("UPDATE albums SET cover_photo_id = ? WHERE id = ?").bind(photoId, albumId).run();
+  }
+  return json({ photo: { id: photoId, caption } }, 201);
+}
+
+// Отдача фото: файл тянем с Диска и отдаём браузеру (ссылки Диска требуют входа в Google)
+async function getAlbumPhoto(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const row = await env.DB.prepare("SELECT drive_file_id, mime, name FROM album_photos WHERE id = ?")
+    .bind(id)
+    .first<{ drive_file_id: string; mime: string; name: string }>();
+  if (!row) return json({ error: "Фото не найдено" }, 404);
+  const token = await driveToken(env);
+  if (!token) return json({ error: "Google Диск не подключён" }, 503);
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(row.drive_file_id)}?alt=media`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok || !res.body) {
+    console.error("Drive read", res.status, await res.text());
+    return json({ error: "Не удалось открыть фото" }, 502);
+  }
+  return new Response(res.body, {
+    headers: {
+      "content-type": row.mime,
+      "cache-control": "private, max-age=3600",
+      "x-content-type-options": "nosniff",
+      ...CORS,
+    },
+  });
+}
+
+async function updateAlbumPhoto(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const row = await env.DB.prepare("SELECT added_by FROM album_photos WHERE id = ?").bind(id).first<{ added_by: number }>();
+  if (!row) return json({ error: "Фото не найдено" }, 404);
+  if (!(canManageGallery(user) || row.added_by === user.id)) {
+    return json({ error: "Менять подпись может загрузивший, комсостав и пресрук" }, 403);
+  }
+  const body = await readJson(request);
+  const caption = str(body.caption, GALLERY_CAPTION_MAX);
+  await env.DB.prepare("UPDATE album_photos SET caption = ? WHERE id = ?").bind(caption, id).run();
+  return json({ ok: true });
+}
+
+async function deleteAlbumPhoto(request: Request, env: Env, id: number): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  const row = await env.DB.prepare("SELECT album_id, drive_file_id, added_by FROM album_photos WHERE id = ?")
+    .bind(id)
+    .first<{ album_id: number; drive_file_id: string; added_by: number }>();
+  if (!row) return json({ error: "Фото не найдено" }, 404);
+  if (!(canManageGallery(user) || row.added_by === user.id)) {
+    return json({ error: "Удалить фото может загрузивший, комсостав и пресрук" }, 403);
+  }
+  await driveDelete(env, await driveToken(env), row.drive_file_id);
+  await env.DB.prepare("DELETE FROM album_photos WHERE id = ?").bind(id).run();
+  // Обложка была эта фотография — ставим следующую по порядку
+  const album = await env.DB.prepare("SELECT cover_photo_id FROM albums WHERE id = ?").bind(row.album_id).first<{ cover_photo_id: number | null }>();
+  if (album?.cover_photo_id === id) {
+    const next = await env.DB.prepare("SELECT MIN(id) AS id FROM album_photos WHERE album_id = ?")
+      .bind(row.album_id)
+      .first<{ id: number | null }>();
+    await env.DB.prepare("UPDATE albums SET cover_photo_id = ? WHERE id = ?").bind(next?.id ?? null, row.album_id).run();
+  }
+  return json({ ok: true });
+}
+
+// Подключение Google Диска: комсостав или пресрук нажимает кнопку, возвращается с ?gallery=connected
+async function galleryOAuthStart(request: Request, env: Env): Promise<Response> {
+  const user = await approvedUser(request, env);
+  if (!user) return json({ error: "Нужен вход" }, 401);
+  if (!canManageGallery(user)) return json({ error: "Подключить Диск может комсостав и пресрук" }, 403);
+  if (!(await galleryConfigured(env))) {
+    return json({ error: "Google Диск не настроен на сервере: нужны GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET" }, 503);
+  }
+  const url = new URL(request.url);
+  const state = randomToken(16);
+  const site = url.searchParams.get("origin") ?? "";
+  const origin = /^https?:\/\/[a-z0-9.:\-]+$/i.test(site) ? site : url.origin;
+  await env.FILES.put(`galstate:${state}`, JSON.stringify({ user_id: user.id, origin }), { expirationTtl: 900 });
+  const params = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID ?? "",
+    redirect_uri: `${url.origin}/api/gallery/oauth/callback`,
+    response_type: "code",
+    scope: "https://www.googleapis.com/auth/drive.file",
+    access_type: "offline",
+    prompt: "consent",
+    state,
+  });
+  return json({ url: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}` });
+}
+
+async function galleryOAuthCallback(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  if (!code || !state) return json({ error: "Нет кода доступа" }, 400);
+  const raw = await env.FILES.get(`galstate:${state}`);
+  if (!raw) return json({ error: "Ссылка устарела: начните подключение заново" }, 400);
+  await env.FILES.delete(`galstate:${state}`);
+  let saved: { user_id: number; origin: string };
+  try {
+    saved = JSON.parse(raw) as { user_id: number; origin: string };
+  } catch {
+    return json({ error: "Плохое состояние входа" }, 400);
+  }
+  const redirectTo = (status: string) =>
+    Response.redirect(`${saved.origin || url.origin}/?gallery=${status}`, 302);
+  if (!(await galleryConfigured(env))) return redirectTo("error");
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: env.GOOGLE_CLIENT_ID ?? "",
+      client_secret: env.GOOGLE_CLIENT_SECRET ?? "",
+      redirect_uri: `${url.origin}/api/gallery/oauth/callback`,
+      grant_type: "authorization_code",
+    }),
+  });
+  if (!tokenRes.ok) {
+    console.error("Drive code exchange", tokenRes.status, await tokenRes.text());
+    return redirectTo("error");
+  }
+  const tokens = (await tokenRes.json()) as { access_token?: string; refresh_token?: string };
+  if (!tokens.access_token || !tokens.refresh_token) return redirectTo("error");
+  const folderRes = await fetch("https://www.googleapis.com/drive/v3/files?fields=id", {
+    method: "POST",
+    headers: { authorization: `Bearer ${tokens.access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({ name: GALLERY_FOLDER, mimeType: "application/vnd.google-apps.folder" }),
+  });
+  if (!folderRes.ok) {
+    console.error("Drive folder", folderRes.status, await folderRes.text());
+    return redirectTo("error");
+  }
+  const folder = (await folderRes.json()) as { id?: string };
+  if (!folder.id) return redirectTo("error");
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO gdrive_auth (id, refresh_token, folder_id, connected_by, connected_at) VALUES (1, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET refresh_token = excluded.refresh_token, folder_id = excluded.folder_id,
+       connected_by = excluded.connected_by, connected_at = excluded.connected_at`,
+  )
+    .bind(tokens.refresh_token, folder.id, saved.user_id, now)
+    .run();
+  await env.FILES.delete("gal:token");
+  return redirectTo("connected");
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -3808,6 +4230,21 @@ export default {
       if (method === "POST" && adminMatch) {
         return await decide(request, env, Number(adminMatch[1]), adminMatch[2] as "approve" | "reject");
       }
+
+      if (method === "GET" && path === "/api/gallery/albums") return await listAlbums(request, env);
+      if (method === "POST" && path === "/api/gallery/albums") return await createAlbum(request, env);
+      if (method === "GET" && path === "/api/gallery/oauth/start") return await galleryOAuthStart(request, env);
+      if (method === "GET" && path === "/api/gallery/oauth/callback") return await galleryOAuthCallback(request, env);
+      const albumMatch = path.match(/^\/api\/gallery\/albums\/(\d+)$/);
+      if (albumMatch && method === "GET") return await getAlbum(request, env, Number(albumMatch[1]));
+      if (albumMatch && method === "PUT") return await updateAlbum(request, env, Number(albumMatch[1]));
+      if (albumMatch && method === "DELETE") return await deleteAlbum(request, env, Number(albumMatch[1]));
+      const albumPhotosMatch = path.match(/^\/api\/gallery\/albums\/(\d+)\/photos$/);
+      if (albumPhotosMatch && method === "POST") return await addAlbumPhoto(request, env, Number(albumPhotosMatch[1]));
+      const galleryPhotoMatch = path.match(/^\/api\/gallery\/photos\/(\d+)$/);
+      if (galleryPhotoMatch && method === "GET") return await getAlbumPhoto(request, env, Number(galleryPhotoMatch[1]));
+      if (galleryPhotoMatch && method === "PUT") return await updateAlbumPhoto(request, env, Number(galleryPhotoMatch[1]));
+      if (galleryPhotoMatch && method === "DELETE") return await deleteAlbumPhoto(request, env, Number(galleryPhotoMatch[1]));
 
       return json({ error: "Не найдено" }, 404);
     } catch (err) {
